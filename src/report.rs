@@ -5,26 +5,54 @@ use crate::monitor::MetricPoint;
 
 const REPORTS_DIR: &str = "reports";
 
-// Функция инициализации: удаляет старую папку и создает чистую новую
 pub fn init_reports_dir() {
     let path = Path::new(REPORTS_DIR);
     if path.exists() {
-        // Удаляем старую папку со всеми файлами внутри
         let _ = fs::remove_dir_all(path);
     }
-    // Создаем пустую папку reports
     fs::create_dir_all(path).expect("Не удалось создать директорию reports");
 }
 
-// Сохранение в JSON внутрь папки reports
 pub fn save_report_json(version_name: &str, data: &[MetricPoint]) {
     let filename = format!("{}/report_{}.json", REPORTS_DIR, version_name);
     let file = File::create(&filename).unwrap();
     serde_json::to_writer_pretty(file, data).expect("Не удалось записать JSON");
-    println!("📊 Данные бенчмарка сохранены в: {}", filename);
+    println!("💾 Данные бенчмарка сохранены в: {}", filename);
 }
 
-// Одиночный график внутрь папки reports
+// Новая функция: Выводит красивую итоговую таблицу (как на скриншоте) в терминал
+pub fn print_visual_report(title: &str, data: &[MetricPoint]) {
+    if data.is_empty() {
+        println!("⚠️  Нет данных для генерации отчета {}", title);
+        return;
+    }
+
+    let count = data.len() as f32;
+    
+    // Вычисление средних значений
+    let avg_cpu = data.iter().map(|p| p.cpu).sum::<f32>() / count;
+    let avg_gpu = data.iter().map(|p| p.gpu).sum::<f32>() / count;
+    let avg_ram = data.iter().map(|p| p.ram_mb as f64).sum::<f64>() / count as f64;
+
+    // Вычисление пиковых (максимальных) значений
+    let max_cpu = data.iter().map(|p| p.cpu).fold(0.0f32, |a, b| a.max(b));
+    let max_gpu = data.iter().map(|p| p.gpu).fold(0.0f32, |a, b| a.max(b));
+    let max_ram = data.iter().map(|p| p.ram_mb).max().unwrap_or(0);
+
+    println!("\n┌─────────────────────────────────────────────────────────┐");
+    println!("│ 📊 PERFORMANCE REPORT: {:<32} │", title.to_uppercase());
+    println!("├─────────────────────────────────────────────────────────┤");
+    println!("│ Статус:           🟢 SUCCESS                            │");
+    println!("│ Продолжительность: {:<2} сек                                 │", data.len());
+    println!("├───────────────────────┬────────────────┬────────────────┤");
+    println!("│ РЕСУРСЫ               │ СРЕДНЕЕ        │ ПИКОВОЕ (MAX)  │");
+    println!("├───────────────────────┼────────────────┼────────────────┤");
+    println!("│ 🖥️  CPU Usage         │ {:>12.2}% │ {:>12.2}% │", avg_cpu, max_cpu);
+    println!("│ 🎮 GPU Usage         │ {:>12.2}% │ {:>12.2}% │", avg_gpu, max_gpu);
+    println!("│ 💾 RAM Allocation    │ {:>11.1} MB │ {:>11} MB │", avg_ram, max_ram);
+    println!("└───────────────────────┴────────────────┴────────────────┘\n");
+}
+
 pub fn generate_single_chart(version_name: &str, data: &[MetricPoint]) {
     let filename = format!("{}/chart_{}.png", REPORTS_DIR, version_name);
     let root = BitMapBackend::new(&filename, (800, 600)).into_drawing_area();
@@ -52,7 +80,6 @@ pub fn generate_single_chart(version_name: &str, data: &[MetricPoint]) {
     println!("📈 График производительности сохранен в: {}", filename);
 }
 
-// Сравнительный график внутрь папки reports
 pub fn generate_comparison_chart(new_data: &[MetricPoint], old_data: &[MetricPoint]) {
     let filename = format!("{}/comparison_report.png", REPORTS_DIR);
     let root = BitMapBackend::new(&filename, (1024, 768)).into_drawing_area();
@@ -70,10 +97,8 @@ pub fn generate_comparison_chart(new_data: &[MetricPoint], old_data: &[MetricPoi
 
     chart.configure_mesh().x_desc("Время сценария (секунды)").y_desc("Использование ресурсов (%)").draw().unwrap();
 
-    // Линии CPU
     chart.draw_series(LineSeries::new(new_data.iter().map(|p| (p.second, p.cpu)), &RED)).unwrap().label("CPU (Актуальная)");
     chart.draw_series(LineSeries::new(old_data.iter().map(|p| (p.second, p.cpu)), &MAGENTA)).unwrap().label("CPU (Старая)");
-    // Линии GPU
     chart.draw_series(LineSeries::new(new_data.iter().map(|p| (p.second, p.gpu)), &BLUE)).unwrap().label("GPU (Актуальная)");
     chart.draw_series(LineSeries::new(old_data.iter().map(|p| (p.second, p.gpu)), &CYAN)).unwrap().label("GPU (Старая)");
 

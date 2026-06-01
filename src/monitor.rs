@@ -1,5 +1,4 @@
 use std::time::Duration;
-// Просто импортируем System (структура Process подтянется автоматически, если нужна)
 use sysinfo::{Pid, System}; 
 use serde::{Serialize, Deserialize};
 use crate::gpu;
@@ -26,10 +25,9 @@ pub async fn start_monitoring(pid: u32, duration_secs: u64) -> Vec<MetricPoint> 
         let mut cpu = 0.0;
         let mut ram = 0;
         
-        // Теперь методы .process() и .cpu_usage() работают без импорта трейтов
         if let Some(process) = sys.process(pid_sys) {
             cpu = process.cpu_usage();
-            ram = process.memory() / 1_048_576; 
+            ram = process.memory() / 1_048_576; // Перевод байт в Мегабайты
         }
         
         let gpu = gpu::get_gpu_usage();

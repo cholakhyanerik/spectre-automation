@@ -3,10 +3,14 @@ use std::thread;
 use std::time::Duration;
 use enigo::{Enigo, Mouse, Settings, Button, Direction, Coordinate};
 
+/// Запускает приложение по указанному пути
 pub fn run_app(path: &str) -> Child {
-    Command::new(path).spawn().expect("Не удалось запустить приложение")
+    Command::new(path)
+        .spawn()
+        .expect("Не удалось запустить приложение")
 }
 
+/// Эмулирует пользовательский сценарий взаимодействия с GUI
 pub fn execute_ui_scenario() {
     // Даем приложению открыться
     thread::sleep(Duration::from_secs(2));
@@ -18,7 +22,7 @@ pub fn execute_ui_scenario() {
     enigo.button(Button::Left, Direction::Click).unwrap();
     thread::sleep(Duration::from_millis(500));
 
-    // Клик 2: Имитируем запуск какой-то тяжелой задачи для теста производительности
+    // Клик 2: Имитируем запуск тяжелой задачи для теста производительности
     enigo.move_mouse(500, 400, Coordinate::Abs).unwrap();
     enigo.button(Button::Left, Direction::Click).unwrap();
     thread::sleep(Duration::from_secs(2));
