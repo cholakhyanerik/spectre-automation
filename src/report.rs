@@ -20,21 +20,15 @@ pub fn save_report_json(version_name: &str, data: &[MetricPoint]) {
     println!("💾 Данные бенчмарка сохранены в: {}", filename);
 }
 
-// Новая функция: Выводит красивую итоговую таблицу (как на скриншоте) в терминал
 pub fn print_visual_report(title: &str, data: &[MetricPoint]) {
     if data.is_empty() {
-        println!("⚠️  Нет данных для генерации отчета {}", title);
         return;
     }
-
     let count = data.len() as f32;
-    
-    // Вычисление средних значений
     let avg_cpu = data.iter().map(|p| p.cpu).sum::<f32>() / count;
     let avg_gpu = data.iter().map(|p| p.gpu).sum::<f32>() / count;
     let avg_ram = data.iter().map(|p| p.ram_mb as f64).sum::<f64>() / count as f64;
 
-    // Вычисление пиковых (максимальных) значений
     let max_cpu = data.iter().map(|p| p.cpu).fold(0.0f32, |a, b| a.max(b));
     let max_gpu = data.iter().map(|p| p.gpu).fold(0.0f32, |a, b| a.max(b));
     let max_ram = data.iter().map(|p| p.ram_mb).max().unwrap_or(0);
@@ -55,29 +49,91 @@ pub fn print_visual_report(title: &str, data: &[MetricPoint]) {
 
 pub fn generate_single_chart(version_name: &str, data: &[MetricPoint]) {
     let filename = format!("{}/chart_{}.png", REPORTS_DIR, version_name);
-    let root = BitMapBackend::new(&filename, (800, 600)).into_drawing_area();
+    
+    // Увеличиваем высоту изображения до 750px, чтобы снизу поместился блок результатов
+    let root = BitMapBackend::new(&filename, (900, 750)).into_drawing_area();
     root.fill(&WHITE).unwrap();
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption(format!("Тест производительности: {}", version_name), ("sans-serif", 24).into_font())
-        .margin(15)
+    // 1. Рассчитываем метрики производительности
+    let count = data.len() as f32;
+    let avg_cpu = if count > 0.0 { data.iter().map(|p| p.cpu).sum::<f32>() / count } else { 0.0 };
+    let avg_gpu = if count > 0.0 { data.iter().map(|p| p.gpu).sum::<f32>() / count } else { 0.0 };
+    let avg_ram = if count > 0.0 { data.iter().map(|p| p.ram_mb as f64).sum::<f64>() / count as f64 } else { 0.0 };
+
+    let max_cpu = data.iter().map(|p| p.cpu).fold(0.0f32, |a, b| a.max(b));
+    let max_gpu = data.iter().map(|p| p.gpu).fold(0.0f32, |a, b| a.max(b));
+    let max_ram = data.iter().map(|p| p.ram_mb).max().unwrap_or(0);
+
+    // Разделяем рабочую область на верхнюю (график) и нижнюю (таблица)
+    let (upper, lower) = root.split_vertically(460);
+
+    // --- ОТРИСОВКА ГРАФИКА (Верхняя область) ---
+    let mut chart = ChartBuilder::on(&upper)
+        .caption(format!("Тест производительности: {}", version_name.to_uppercase()), ("sans-serif", 24).into_font())
+        .margin(20)
         .x_label_area_size(40)
         .y_label_area_size(40)
         .build_cartesian_2d(0..data.len() + 1, 0.0f32..100.0f32) 
         .unwrap();
 
-    chart.configure_mesh().x_desc("Время (сек)").y_desc("Нагрузка (%)").draw().unwrap();
+    chart.configure_mesh()
+        .x_desc("Время (сек)")
+        .y_desc("Нагрузка (%)")
+        .draw()
+        .unwrap();
 
+    // Отрисовываем линию CPU
     chart.draw_series(LineSeries::new(data.iter().map(|p| (p.second, p.cpu)), &RED)).unwrap()
         .label("CPU (%)")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
 
+    // Отрисовываем линию GPU
     chart.draw_series(LineSeries::new(data.iter().map(|p| (p.second, p.gpu)), &BLUE)).unwrap()
         .label("GPU (%)")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE));
 
-    chart.configure_series_labels().background_style(WHITE.mix(0.8)).draw().unwrap();
-    println!("📈 График производительности сохранен в: {}", filename);
+    chart.configure_series_labels()
+        .background_style(WHITE.mix(0.8))
+        .border_style(&BLACK)
+        .draw()
+        .unwrap();
+
+    // --- ОТРИСОВКА ТАБЛИЦЫ РЕЗУЛЬТАТОВ (Нижняя область) ---
+    // Рисуем внешнюю рамку таблицы
+    lower.draw(&Rectangle::new([(40, 10), (860, 250)], Into::<ShapeStyle>::into(&BLACK).stroke_width(2))).unwrap();
+    
+    // Определяем стили шрифтов (вместо вызова .bold())
+    let font_title = ("sans-serif", 18).into_font().style(FontStyle::Bold);
+    let font_header = ("sans-serif", 14).into_font().style(FontStyle::Bold);
+    let font_normal = ("sans-serif", 14).into_font();
+
+    // Заголовок карточки
+    lower.draw(&Text::new("📊 PERFORMANCE SUMMARY REPORT (BENCHMARK)", (60, 25), font_title.color(&BLACK))).unwrap();
+    
+    // Заголовки столбцов таблицы ресурсов
+    lower.draw(&Text::new("РЕСУРСЫ", (80, 70), font_header.color(&BLACK))).unwrap();
+    lower.draw(&Text::new("СРЕДНЕЕ ЗНАЧЕНИЕ", (320, 70), font_header.color(&BLACK))).unwrap();
+    lower.draw(&Text::new("ПИКОВОЕ (MAX)", (620, 70), font_header.color(&BLACK))).unwrap();
+    
+    // Линия-разделитель под шапкой
+    lower.draw(&PathElement::new(vec![(50, 95), (850, 95)], &BLACK)).unwrap();
+
+    // Строка CPU Usage
+    lower.draw(&Text::new("🖥️  CPU Usage", (80, 115), font_normal.color(&BLACK))).unwrap();
+    lower.draw(&Text::new(format!("{:.2} %", avg_cpu), (320, 115), font_normal.color(&RED))).unwrap();
+    lower.draw(&Text::new(format!("{:.2} %", max_cpu), (620, 115), font_normal.color(&RED))).unwrap();
+
+    // Строка GPU Usage
+    lower.draw(&Text::new("🎮  GPU Usage", (80, 155), font_normal.color(&BLACK))).unwrap();
+    lower.draw(&Text::new(format!("{:.2} %", avg_gpu), (320, 155), font_normal.color(&BLUE))).unwrap();
+    lower.draw(&Text::new(format!("{:.2} %", max_gpu), (620, 155), font_normal.color(&BLUE))).unwrap();
+
+    // Строка RAM Allocation
+    lower.draw(&Text::new("💾  RAM Allocation", (80, 195), font_normal.color(&BLACK))).unwrap();
+    lower.draw(&Text::new(format!("{:.1} MB", avg_ram), (320, 195), font_normal.color(&MAGENTA))).unwrap();
+    lower.draw(&Text::new(format!("{} MB", max_ram), (620, 195), font_normal.color(&MAGENTA))).unwrap();
+
+    println!("📈 Сводный график с таблицей метрик сохранен в: {}", filename);
 }
 
 pub fn generate_comparison_chart(new_data: &[MetricPoint], old_data: &[MetricPoint]) {
