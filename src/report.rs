@@ -156,3 +156,65 @@ pub fn generate_comparison_chart(new_data: &[MetricPoint], old_data: &[MetricPoi
     chart.configure_series_labels().background_style(WHITE.mix(0.8)).border_style(&BLACK).draw().unwrap();
     println!("👉 Сводный сравнительный график сохранен в: {}", filename);
 }
+
+// ---------------------------------------------------------
+// НОВАЯ ФУНКЦИЯ ДЛЯ ВЫВОДА ТАБЛИЦЫ СРАВНЕНИЯ В КОНСОЛЬ
+// ---------------------------------------------------------
+pub fn print_comparison_report(new_data: &[MetricPoint], old_data: &[MetricPoint]) {
+    if new_data.is_empty() || old_data.is_empty() {
+        return;
+    }
+
+    // 1. Считаем средние значения
+    let new_count = new_data.len() as f32;
+    let new_avg_cpu = (new_data.iter().map(|p| p.cpu).sum::<f32>() / new_count).min(100.0);
+    let new_avg_gpu = (new_data.iter().map(|p| p.gpu).sum::<f32>() / new_count).min(100.0);
+    let new_avg_ram = new_data.iter().map(|p| p.ram_mb as f64).sum::<f64>() / new_count as f64;
+
+    let old_count = old_data.len() as f32;
+    let old_avg_cpu = (old_data.iter().map(|p| p.cpu).sum::<f32>() / old_count).min(100.0);
+    let old_avg_gpu = (old_data.iter().map(|p| p.gpu).sum::<f32>() / old_count).min(100.0);
+    let old_avg_ram = old_data.iter().map(|p| p.ram_mb as f64).sum::<f64>() / old_count as f64;
+
+    // 2. Считаем разницу (Δ)
+    let diff_cpu = new_avg_cpu - old_avg_cpu;
+    let diff_gpu = new_avg_gpu - old_avg_gpu;
+    let diff_ram = new_avg_ram - old_avg_ram;
+
+    // 3. Функция форматирования с цветами ANSI (красный - стало хуже, зеленый - стало лучше)
+    let format_diff = |val: f64, unit: &str| -> String {
+        let sign = if val > 0.0 { "+" } else { "" };
+        let text = format!("[{}{:.1}{}]", sign, val, unit);
+        let padded = format!("{:>12}", text); 
+        
+        if val > 0.0 {
+            format!("\x1b[31m{}\x1b[0m", padded) // Красный (выросла нагрузка)
+        } else if val < 0.0 {
+            format!("\x1b[32m{}\x1b[0m", padded) // Зеленый (упала нагрузка, оптимизация)
+        } else {
+            padded // Без цвета, если изменений нет
+        }
+    };
+
+    let diff_cpu_str = format_diff(diff_cpu as f64, "%");
+    let diff_gpu_str = format_diff(diff_gpu as f64, "%");
+    let diff_ram_str = format_diff(diff_ram, " MB");
+
+    let new_cpu_str = format!("{:.2}%", new_avg_cpu);
+    let old_cpu_str = format!("{:.2}%", old_avg_cpu);
+    let new_gpu_str = format!("{:.2}%", new_avg_gpu);
+    let old_gpu_str = format!("{:.2}%", old_avg_gpu);
+    let new_ram_str = format!("{:.1} MB", new_avg_ram);
+    let old_ram_str = format!("{:.1} MB", old_avg_ram);
+
+    // 4. Отрисовка таблицы
+    println!("\n┌───────────────────────┬────────────────────┬─────────────────┬──────────────┐");
+    println!("│ 📊 COMPARISON REPORT: ACTUAL VS OLD                                         │");
+    println!("├───────────────────────┬────────────────────┬─────────────────┬──────────────┤");
+    println!("│ РЕСУРСЫ               │ АКТУАЛЬНАЯ ВЕРСИЯ  │ СТАРАЯ ВЕРСИЯ   │ РАЗНИЦА (Δ)  │");
+    println!("├───────────────────────┼────────────────────┼─────────────────┼──────────────┤");
+    println!("│ 🖥️  CPU Usage         │ {:>18} │ {:>15} │ {} │", new_cpu_str, old_cpu_str, diff_cpu_str);
+    println!("│ 🎮 GPU Usage         │ {:>18} │ {:>15} │ {} │", new_gpu_str, old_gpu_str, diff_gpu_str);
+    println!("│ 💾 RAM Allocation    │ {:>18} │ {:>15} │ {} │", new_ram_str, old_ram_str, diff_ram_str);
+    println!("└───────────────────────┴────────────────────┴─────────────────┴──────────────┘\n");
+}

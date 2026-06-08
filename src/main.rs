@@ -76,6 +76,9 @@ async fn main() {
         // Генерируем красивую визуальную таблицу для старой версии
         report::print_visual_report("Old Version", &metrics_old);
 
+        // 🚀 ВЫЗОВ НОВОЙ ТАБЛИЦЫ СРАВНЕНИЯ В КОНСОЛЬ
+        report::print_comparison_report(&metrics_new, &metrics_old);
+
         report::save_report_json("old_version", &metrics_old);
         report::generate_comparison_chart(&metrics_new, &metrics_old);
     } else {
