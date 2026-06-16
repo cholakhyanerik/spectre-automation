@@ -9,6 +9,7 @@ tokio = { version = ">= 1.0", features = ["full"] }
 serde = { version = ">= 1.0", features = ["derive"] }
 serde_json = ">= 1.0"
 plotters = ">= 0.3"
+chrono = "0.4" # Добавлено для фиксации даты и времени запусков
 
 # Разрешаем версии выше текущих стабильных
 enigo = ">= 0.6"

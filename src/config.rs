@@ -4,7 +4,7 @@ use dotenvy::dotenv;
 pub struct Config {
     pub app_path_new: String,
     pub app_path_old: Option<String>,
-    pub test_duration_secs: u64, // Новое конфигурационное поле
+    pub test_duration_secs: u64,
 }
 
 impl Config {

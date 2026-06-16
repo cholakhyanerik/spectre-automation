@@ -12,12 +12,20 @@ fn check_terminal_state() -> bool {
     
     if Path::new(db_path).exists() {
         println!("💾 Найдена существующая база exchanges.db!");
-        println!("🔥 ТЕСТ: Замер производительности при восстановлении сохраненного стейта (стаканы, кластеры, подписки).");
+        println!("🔥 ТЕСТ: Замер производительности при восстановлении сохраненного стейта.");
         true
     } else {
         println!("ℹ️  Файл exchanges.db не найден. Тест начнется с чистого экрана (стейт пуст).");
         false
     }
+}
+
+// Вспомогательная функция для извлечения имени файла из пути
+fn extract_filename(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown.exe".to_string())
 }
 
 #[tokio::main]
@@ -26,65 +34,66 @@ async fn main() {
     println!("🚀 Запуск Spectre-Automation: Сбор метрик десктоп GUI");
     println!("====================================================");
 
-    // 1. Создаем или очищаем папку /reports
+    // 1. Создаем папку current и history (current при этом будет очищена!)
     report::init_reports_dir();
 
-    // 2. Загружаем конфигурацию из .env
+    // 2. Загружаем конфигурацию
     let cfg = Config::load();
     println!("ℹ️  Настроенная длительность тестов: {} сек", cfg.test_duration_secs);
 
-    // 3. Проверяем состояние базы данных перед запуском
+    // 3. Проверяем состояние БД
     check_terminal_state();
 
+    let exe_name_new = extract_filename(&cfg.app_path_new);
+
     // --- ТЕСТИРУЕМ АКТУАЛЬНУЮ ВЕРСИЮ ---
-    println!("\n[Шаг 1] Запуск АКТУАЛЬНОЙ версии spectre-terminal...");
+    println!("\n[Шаг 1] Запуск АКТУАЛЬНОЙ версии ({})...", exe_name_new);
     let mut process_new = runner::run_app(&cfg.app_path_new);
     let pid_new = process_new.id();
 
-    // Мониторим на основе динамической длительности из конфига
-    let monitor_handle_new = tokio::spawn(monitor::start_monitoring(pid_new, cfg.test_duration_secs));
-    
-    // Эмуляция кликов пользователя
+    // Мониторим
+    let monitor_handle_new = tokio::spawn(monitor::start_monitoring(pid_new, cfg.test_duration_secs, exe_name_new));
     runner::execute_ui_scenario();
 
-    let metrics_new = monitor_handle_new.await.unwrap();
-    let _ = process_new.kill(); // Закрываем терминал после теста
+    let result_new = monitor_handle_new.await.unwrap();
+    let _ = process_new.kill();
     println!("✅ Тест актуальной версии завершен.");
 
-    // Генерируем красивую визуальную таблицу для актуальной версии
-    report::print_visual_report("Actual Version", &metrics_new);
+    // Сохраняем и выводим отчеты
+    report::print_visual_report("Actual Version", &result_new);
+    report::save_report_json("actual", &result_new);
+    report::save_run_to_history(&result_new); 
 
-    // Сохраняем отчеты в папку /reports
-    report::save_report_json("actual_version", &metrics_new);
-
-    // --- ПРОВЕРЯЕМ СТАРУЮ ВЕРСИЮ (Опционально) ---
+    // --- ПРОВЕРЯЕМ СТАРУЮ ВЕРСИЮ ---
     if let Some(app_path_old) = cfg.app_path_old {
-        println!("\n[Шаг 2] Обнаружена СТАРАЯ версия. Запуск для сравнения стейтов...");
+        let exe_name_old = extract_filename(&app_path_old);
+        println!("\n[Шаг 2] Обнаружена СТАРАЯ версия ({}). Запуск для сравнения...", exe_name_old);
         
         let mut process_old = runner::run_app(&app_path_old);
         let pid_old = process_old.id();
 
-        // Также используем динамическую длительность для старой версии
-        let monitor_handle_old = tokio::spawn(monitor::start_monitoring(pid_old, cfg.test_duration_secs));
-        
+        let monitor_handle_old = tokio::spawn(monitor::start_monitoring(pid_old, cfg.test_duration_secs, exe_name_old));
         runner::execute_ui_scenario();
 
-        let metrics_old = monitor_handle_old.await.unwrap();
+        let result_old = monitor_handle_old.await.unwrap();
         let _ = process_old.kill();
         println!("✅ Тест старой версии завершен.");
 
-        // Генерируем красивую визуальную таблицу для старой версии
-        report::print_visual_report("Old Version", &metrics_old);
+        report::print_visual_report("Old Version", &result_old);
+        report::save_report_json("old", &result_old);
+        report::save_run_to_history(&result_old);
 
-        // 🚀 ВЫЗОВ НОВОЙ ТАБЛИЦЫ СРАВНЕНИЯ В КОНСОЛЬ
-        report::print_comparison_report(&metrics_new, &metrics_old);
-
-        report::save_report_json("old_version", &metrics_old);
-        report::generate_comparison_chart(&metrics_new, &metrics_old);
+        // Сравнительные отчеты
+        report::print_comparison_report(&result_new, &result_old);
+        report::generate_comparison_chart(&result_new, &result_old);
     } else {
         println!("\n[Инфо] Старая версия не указана. Генерируем одиночный график...");
-        report::generate_single_chart("actual_version", &metrics_new);
+        report::generate_single_chart("actual", &result_new);
     }
+
+    // --- АРХИВАЦИЯ РЕЗУЛЬТАТОВ ---
+    // Копируем все файлы текущего прогона в history/ с временными метками
+    report::archive_current_run();
 
     println!("\n🎉 Тестирование успешно завершено! Отчеты сохранены в 'reports/'");
     println!("====================================================");

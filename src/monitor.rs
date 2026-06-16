@@ -1,7 +1,8 @@
 use std::time::Duration;
 use sysinfo::{Pid, System}; 
 use serde::{Serialize, Deserialize};
-use crate::gpu;
+use chrono::{DateTime, Local};
+use crate::gpu::GpuMonitor;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricPoint {
@@ -11,12 +12,24 @@ pub struct MetricPoint {
     pub gpu: f32,
 }
 
-pub async fn start_monitoring(pid: u32, duration_secs: u64) -> Vec<MetricPoint> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestResult {
+    pub timestamp: String,
+    pub exe_name: String,
+    pub duration_secs: u64,
+    pub metrics: Vec<MetricPoint>,
+}
+
+pub async fn start_monitoring(pid: u32, duration_secs: u64, exe_name: String) -> TestResult {
     let mut sys = System::new_all();
     let mut history = Vec::new();
     let main_pid = Pid::from(pid as usize);
+    let start_time: DateTime<Local> = Local::now();
+    
+    // Инициализация монитора GPU (без повторных пересозданий)
+    let gpu_monitor = GpuMonitor::new();
 
-    // Первоначальное обновление для инициализации счетчиков
+    // Первоначальное обновление для инициализации счетчиков (важно для точного CPU)
     sys.refresh_all();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -34,7 +47,7 @@ pub async fn start_monitoring(pid: u32, duration_secs: u64) -> Vec<MetricPoint> 
         // Собираем метрики по всему дереву процессов
         collect_tree_metrics(&sys, main_pid, &mut total_cpu, &mut total_ram_bytes);
         
-        // 1. Приводим CPU к стандартным 0-100% (делением на кол-во ядер) и ограничиваем до 100.0
+        // 1. Приводим CPU к стандартным 0-100% и ограничиваем
         let mut normalized_cpu = total_cpu / safe_cpu_count;
         if normalized_cpu > 100.0 {
             normalized_cpu = 100.0;
@@ -43,8 +56,8 @@ pub async fn start_monitoring(pid: u32, duration_secs: u64) -> Vec<MetricPoint> 
         // Переводим байты в Мегабайты
         let ram_mb = total_ram_bytes / 1_048_576; 
         
-        // Получаем и нормализуем GPU (также гарантируем не более 100%)
-        let mut gpu_usage = gpu::get_gpu_usage();
+        // 2. Асинхронно получаем GPU без блокировки потока
+        let mut gpu_usage = gpu_monitor.get_gpu_usage().await;
         if gpu_usage > 100.0 {
             gpu_usage = 100.0;
         }
@@ -59,7 +72,12 @@ pub async fn start_monitoring(pid: u32, duration_secs: u64) -> Vec<MetricPoint> 
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    history
+    TestResult {
+        timestamp: start_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+        exe_name,
+        duration_secs,
+        metrics: history,
+    }
 }
 
 /// Рекурсивная функция для обхода дерева процессов и суммирования их ресурсов
@@ -69,7 +87,6 @@ fn collect_tree_metrics(sys: &System, pid: Pid, total_cpu: &mut f32, total_ram: 
         *total_ram += process.memory();
     }
 
-    // Ищем все дочерние процессы, у которых parent_pid равен текущему pid
     for (p_pid, process) in sys.processes() {
         if let Some(parent) = process.parent() {
             if parent == pid {
