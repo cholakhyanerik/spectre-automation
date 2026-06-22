@@ -7,15 +7,16 @@ mod runner;
 use config::Config;
 use std::path::Path;
 
-fn check_terminal_state() -> bool {
-    let db_path = "C:\\Users\\chola\\AppData\\Local\\spectre-terminal\\exchanges.db";
-    
-    if Path::new(db_path).exists() {
-        println!("💾 Найдена существующая база exchanges.db!");
+fn check_terminal_state(db_path: &Path) -> bool {
+    if db_path.exists() {
+        println!("💾 Найдена существующая база exchanges.db: {}", db_path.display());
         println!("🔥 ТЕСТ: Замер производительности при восстановлении сохраненного стейта.");
         true
     } else {
-        println!("ℹ️  Файл exchanges.db не найден. Тест начнется с чистого экрана (стейт пуст).");
+        println!(
+            "ℹ️  Файл exchanges.db не найден ({}). Тест начнется с чистого экрана (стейт пуст).",
+            db_path.display()
+        );
         false
     }
 }
@@ -39,10 +40,11 @@ async fn main() {
 
     // 2. Загружаем конфигурацию
     let cfg = Config::load();
+    println!("🖥️  Платформа: {}", config::platform_name());
     println!("ℹ️  Настроенная длительность тестов: {} сек", cfg.test_duration_secs);
 
     // 3. Проверяем состояние БД
-    check_terminal_state();
+    check_terminal_state(&cfg.db_path);
 
     let exe_name_new = extract_filename(&cfg.app_path_new);
 
@@ -52,11 +54,18 @@ async fn main() {
     let pid_new = process_new.id();
 
     // Мониторим
-    let monitor_handle_new = tokio::spawn(monitor::start_monitoring(pid_new, cfg.test_duration_secs, exe_name_new));
+    let monitor_handle_new = tokio::spawn(monitor::start_monitoring(
+        pid_new,
+        cfg.test_duration_secs,
+        exe_name_new,
+        cfg.match_processes.clone(),
+    ));
     runner::execute_ui_scenario();
 
     let result_new = monitor_handle_new.await.unwrap();
+    // Завершаем главный процесс и все окна/модалки приложения
     let _ = process_new.kill();
+    monitor::terminate_app(pid_new, &cfg.match_processes);
     println!("✅ Тест актуальной версии завершен.");
 
     // Сохраняем и выводим отчеты
@@ -72,11 +81,17 @@ async fn main() {
         let mut process_old = runner::run_app(&app_path_old);
         let pid_old = process_old.id();
 
-        let monitor_handle_old = tokio::spawn(monitor::start_monitoring(pid_old, cfg.test_duration_secs, exe_name_old));
+        let monitor_handle_old = tokio::spawn(monitor::start_monitoring(
+            pid_old,
+            cfg.test_duration_secs,
+            exe_name_old,
+            cfg.match_processes.clone(),
+        ));
         runner::execute_ui_scenario();
 
         let result_old = monitor_handle_old.await.unwrap();
         let _ = process_old.kill();
+        monitor::terminate_app(pid_old, &cfg.match_processes);
         println!("✅ Тест старой версии завершен.");
 
         report::print_visual_report("Old Version", &result_old);
