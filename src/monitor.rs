@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::Duration;
+use tokio::time::{Duration, Instant, sleep, sleep_until};
 use sysinfo::{Pid, System};
 use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Local};
@@ -53,33 +53,33 @@ pub async fn start_monitoring(
 
     // Первоначальное обновление для инициализации счетчиков (важно для точного CPU)
     sys.refresh_all();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(200)).await;
 
     // Определяем количество логических ядер процессора
     let cpu_count = sys.cpus().len() as f32;
     let safe_cpu_count = if cpu_count > 0.0 { cpu_count } else { 1.0 };
 
+    // Точка отсчёта для семплинга с фиксированным шагом в 1 сек.
+    // Дедлайн n-го замера = loop_start + n секунд. Если итерация заняла дольше
+    // секунды (на Windows опрос GPU через PowerShell бывает медленным),
+    // sleep_until вернётся сразу — дрейф не накапливается, ось времени не «плывёт».
+    let loop_start = Instant::now();
+
     for second in 1..=duration_secs {
         sys.refresh_all();
-        
+
         // Агрегируем метрики по всем процессам приложения:
         // дерево потомков ∪ процессы, чьё имя совпало с паттернами (дедуп по PID).
         let (total_cpu, total_ram_bytes) = collect_app_metrics(&sys, main_pid, &patterns);
-        
-        // 1. Приводим CPU к стандартным 0-100% и ограничиваем
-        let mut normalized_cpu = total_cpu / safe_cpu_count;
-        if normalized_cpu > 100.0 {
-            normalized_cpu = 100.0;
-        }
+
+        // Приводим CPU к стандартным 0-100% и ограничиваем сверху.
+        let normalized_cpu = (total_cpu / safe_cpu_count).min(100.0);
 
         // Переводим байты в Мегабайты
-        let ram_mb = total_ram_bytes / 1_048_576; 
-        
-        // 2. Асинхронно получаем GPU без блокировки потока
-        let mut gpu_usage = gpu_monitor.get_gpu_usage().await;
-        if gpu_usage > 100.0 {
-            gpu_usage = 100.0;
-        }
+        let ram_mb = total_ram_bytes / 1_048_576;
+
+        // Асинхронно получаем GPU без блокировки потока.
+        let gpu_usage = gpu_monitor.get_gpu_usage().await.min(100.0);
 
         history.push(MetricPoint {
             second: second as usize,
@@ -87,8 +87,8 @@ pub async fn start_monitoring(
             ram_mb,
             gpu: gpu_usage,
         });
-        
-        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        sleep_until(loop_start + Duration::from_secs(second)).await;
     }
 
     TestResult {
@@ -113,12 +113,11 @@ fn collect_subtree(sys: &System, main_pid: Pid) -> HashSet<Pid> {
             if tree.contains(pid) {
                 continue;
             }
-            if let Some(parent) = process.parent() {
-                if tree.contains(&parent) {
+            if let Some(parent) = process.parent()
+                && tree.contains(&parent) {
                     tree.insert(*pid);
                     added = true;
                 }
-            }
         }
         if !added {
             break;

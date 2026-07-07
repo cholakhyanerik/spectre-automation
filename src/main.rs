@@ -29,6 +29,58 @@ fn extract_filename(path: &str) -> String {
         .unwrap_or_else(|| "unknown.exe".to_string())
 }
 
+/// Запускает приложение, снимает метрики за `duration_secs`, затем гарантированно
+/// завершает и «пожинает» (`wait`) процесс со всем деревом окон/модалок.
+///
+/// Возвращает `None`, если приложение не удалось запустить или мониторинг упал —
+/// вызывающая сторона решает, критично это (актуальная версия) или можно
+/// пропустить (старая версия для сравнения). Никаких паник и утечек процессов:
+/// очистка выполняется в любом случае.
+async fn run_single_test(
+    step: &str,
+    label: &str,
+    app_path: &str,
+    duration_secs: u64,
+    match_processes: Vec<String>,
+) -> Option<monitor::TestResult> {
+    let exe_name = extract_filename(app_path);
+    println!("\n{} Запуск {} ({})...", step, label, exe_name);
+
+    let mut child = match runner::run_app(app_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("❌ Не удалось запустить приложение '{}': {}", app_path, e);
+            return None;
+        }
+    };
+    let pid = child.id();
+
+    let monitor_handle = tokio::spawn(monitor::start_monitoring(
+        pid,
+        duration_secs,
+        exe_name,
+        match_processes.clone(),
+    ));
+    runner::execute_ui_scenario();
+
+    let result = match monitor_handle.await {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!("❌ Задача мониторинга завершилась с ошибкой: {}", e);
+            None
+        }
+    };
+
+    // Очистка выполняется ВСЕГДA, даже если мониторинг упал: сначала гасим
+    // сам процесс и «пожинаем» его (иначе остаётся зомби), затем добиваем
+    // дерево окон/модалок, чтобы осиротевшие окна не искажали следующий прогон.
+    let _ = child.kill();
+    let _ = child.wait();
+    monitor::terminate_app(pid, &match_processes);
+
+    result
+}
+
 #[tokio::main]
 async fn main() {
     println!("====================================================");
@@ -46,64 +98,64 @@ async fn main() {
     // 3. Проверяем состояние БД
     check_terminal_state(&cfg.db_path);
 
-    let exe_name_new = extract_filename(&cfg.app_path_new);
-
     // --- ТЕСТИРУЕМ АКТУАЛЬНУЮ ВЕРСИЮ ---
-    println!("\n[Шаг 1] Запуск АКТУАЛЬНОЙ версии ({})...", exe_name_new);
-    let mut process_new = runner::run_app(&cfg.app_path_new);
-    let pid_new = process_new.id();
-
-    // Мониторим
-    let monitor_handle_new = tokio::spawn(monitor::start_monitoring(
-        pid_new,
+    let result_new = match run_single_test(
+        "[Шаг 1]",
+        "АКТУАЛЬНОЙ версии",
+        &cfg.app_path_new,
         cfg.test_duration_secs,
-        exe_name_new,
         cfg.match_processes.clone(),
-    ));
-    runner::execute_ui_scenario();
-
-    let result_new = monitor_handle_new.await.unwrap();
-    // Завершаем главный процесс и все окна/модалки приложения
-    let _ = process_new.kill();
-    monitor::terminate_app(pid_new, &cfg.match_processes);
+    )
+    .await
+    {
+        Some(r) => r,
+        None => {
+            eprintln!("❌ Не удалось протестировать актуальную версию. Завершение работы.");
+            return;
+        }
+    };
     println!("✅ Тест актуальной версии завершен.");
 
     // Сохраняем и выводим отчеты
     report::print_visual_report("Actual Version", &result_new);
     report::save_report_json("actual", &result_new);
-    report::save_run_to_history(&result_new); 
+    report::save_run_to_history(&result_new);
 
     // --- ПРОВЕРЯЕМ СТАРУЮ ВЕРСИЮ ---
+    let mut compared = false;
     if let Some(app_path_old) = cfg.app_path_old {
-        let exe_name_old = extract_filename(&app_path_old);
-        println!("\n[Шаг 2] Обнаружена СТАРАЯ версия ({}). Запуск для сравнения...", exe_name_old);
-        
-        let mut process_old = runner::run_app(&app_path_old);
-        let pid_old = process_old.id();
-
-        let monitor_handle_old = tokio::spawn(monitor::start_monitoring(
-            pid_old,
+        if let Some(result_old) = run_single_test(
+            "[Шаг 2] Обнаружена",
+            "СТАРОЙ версии",
+            &app_path_old,
             cfg.test_duration_secs,
-            exe_name_old,
             cfg.match_processes.clone(),
-        ));
-        runner::execute_ui_scenario();
+        )
+        .await
+        {
+            println!("✅ Тест старой версии завершен.");
 
-        let result_old = monitor_handle_old.await.unwrap();
-        let _ = process_old.kill();
-        monitor::terminate_app(pid_old, &cfg.match_processes);
-        println!("✅ Тест старой версии завершен.");
+            report::print_visual_report("Old Version", &result_old);
+            report::save_report_json("old", &result_old);
+            report::save_run_to_history(&result_old);
 
-        report::print_visual_report("Old Version", &result_old);
-        report::save_report_json("old", &result_old);
-        report::save_run_to_history(&result_old);
-
-        // Сравнительные отчеты
-        report::print_comparison_report(&result_new, &result_old);
-        report::generate_comparison_chart(&result_new, &result_old);
+            // Сравнительные отчеты
+            report::print_comparison_report(&result_new, &result_old);
+            if let Err(e) = report::generate_comparison_chart(&result_new, &result_old) {
+                eprintln!("⚠️  Не удалось построить сравнительный график: {}", e);
+            }
+            compared = true;
+        } else {
+            eprintln!("⚠️  Старую версию протестировать не удалось — строим одиночный график актуальной.");
+        }
     } else {
         println!("\n[Инфо] Старая версия не указана. Генерируем одиночный график...");
-        report::generate_single_chart("actual", &result_new);
+    }
+
+    if !compared
+        && let Err(e) = report::generate_single_chart("actual", &result_new)
+    {
+        eprintln!("⚠️  Не удалось построить график: {}", e);
     }
 
     // --- АРХИВАЦИЯ РЕЗУЛЬТАТОВ ---

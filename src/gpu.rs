@@ -31,8 +31,8 @@ impl GpuMonitor {
     pub fn new() -> Self {
         // 1. NVIDIA через NVML — самый точный и быстрый путь (Windows + Linux).
         let nvml = Nvml::init().ok();
-        if let Some(ref n) = nvml {
-            if let Ok(device) = n.device_by_index(0) {
+        if let Some(ref n) = nvml
+            && let Ok(device) = n.device_by_index(0) {
                 let name = device
                     .name()
                     .unwrap_or_else(|_| "NVIDIA GPU".to_string());
@@ -42,7 +42,6 @@ impl GpuMonitor {
                     name,
                 };
             }
-        }
 
         // 2. Linux: AMD/Intel через sysfs gpu_busy_percent.
         #[cfg(target_os = "linux")]
@@ -90,13 +89,11 @@ impl GpuMonitor {
     pub async fn get_gpu_usage(&self) -> f32 {
         match &self.backend {
             GpuBackend::Nvidia => {
-                if let Some(ref nvml) = self.nvml {
-                    if let Ok(device) = nvml.device_by_index(0) {
-                        if let Ok(util) = device.utilization_rates() {
+                if let Some(ref nvml) = self.nvml
+                    && let Ok(device) = nvml.device_by_index(0)
+                        && let Ok(util) = device.utilization_rates() {
                             return util.gpu as f32;
                         }
-                    }
-                }
                 0.0
             }
 
@@ -179,14 +176,40 @@ fn windows_gpu_name() -> Option<String> {
 /// Берём МАКСИМУМ по всем движкам, а не сумму: суммирование 3D+Copy+Video+Compute
 /// сильно завышает значение и легко уходит за 100%. Максимум одного движка —
 /// корректный показатель утилизации видеокарты.
+///
+/// Имена счётчиков производительности ЛОКАЛИЗОВАНЫ: на русской Windows путь
+/// "\GPU Engine(*)\Utilization Percentage" не существует и Get-Counter вернёт
+/// пусто. Поэтому сначала пытаемся построить локализованный путь через реестр
+/// Perflib (английские имена -> ID -> имена текущего языка), а при любой ошибке
+/// откатываемся на английский вариант.
 #[cfg(target_os = "windows")]
 async fn windows_gpu_usage() -> f32 {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+function Get-GpuCounterPath {
+    try {
+        $base = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib'
+        $en  = (Get-ItemProperty "$base\009").Counter
+        $loc = (Get-ItemProperty "$base\CurrentLanguage").Counter
+        $idOf   = { param($a, $n) for ($i = 1; $i -lt $a.Length; $i += 2) { if ($a[$i] -ieq $n) { return $a[$i - 1] } } }
+        $nameOf = { param($a, $id) for ($i = 0; $i -lt $a.Length; $i += 2) { if ($a[$i] -eq $id) { return $a[$i + 1] } } }
+        $setId = & $idOf $en 'GPU Engine'
+        $ctrId = & $idOf $en 'Utilization Percentage'
+        if ($setId -and $ctrId) {
+            $setL = & $nameOf $loc $setId
+            $ctrL = & $nameOf $loc $ctrId
+            if ($setL -and $ctrL) { return "\$setL(*)\$ctrL" }
+        }
+    } catch {}
+    return '\GPU Engine(*)\Utilization Percentage'
+}
+$path = Get-GpuCounterPath
+$samples = (Get-Counter $path -ErrorAction SilentlyContinue).CounterSamples
+if ($samples) { ($samples | Measure-Object -Property CookedValue -Maximum).Maximum } else { 0 }
+"#;
+
     let output = tokio::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Maximum | Select-Object -ExpandProperty Maximum",
-        ])
+        .args(["-NoProfile", "-Command", SCRIPT])
         .output()
         .await;
 

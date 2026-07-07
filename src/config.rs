@@ -61,28 +61,22 @@ impl Config {
 }
 
 /// Выводит паттерны имён процессов из пути к бинарю.
-/// Например "spectre-terminal.exe" -> ["spectre-terminal", "spectre"],
-/// где общий префикс "spectre" ловит модалки вроде "Spectre Settings".
+/// Например "spectre-terminal.exe" -> ["spectre-terminal"].
+///
+/// ВАЖНО: берём только ПОЛНОЕ имя файла без расширения, а не короткий префикс
+/// семейства. Сопоставление в мониторе идёт по подстроке (`contains`) и в конце
+/// прогона по этим же паттернам процессы УБИВАЮТСЯ. Короткий общий префикс
+/// (например "dev" из "dev-latest") совпал бы с посторонними процессами и
+/// прибил бы их. Полное имя ("dev-latest") при этом всё ещё ловит мультиоконный
+/// режим ("dev-latest.exe (2)"). Модалки-приложения (например "Spectre Settings")
+/// нужно задавать явно через MATCH_PROCESSES в .env.
 fn default_match_patterns(app_path: &str) -> Vec<String> {
-    let stem = std::path::Path::new(app_path)
+    std::path::Path::new(app_path)
         .file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-
-    let mut patterns = Vec::new();
-    if !stem.is_empty() {
-        // Префикс до первого '-' (семейство приложения), если он осмысленный
-        if let Some((prefix, _)) = stem.split_once('-') {
-            if prefix.len() >= 3 {
-                patterns.push(prefix.to_string());
-            }
-        }
-        // Полное имя как запасной вариант, если префикс не добавлен
-        if patterns.is_empty() {
-            patterns.push(stem);
-        }
-    }
-    patterns
+        .filter(|s| !s.is_empty())
+        .into_iter()
+        .collect()
 }
 
 /// Человекочитаемое имя текущей платформы.

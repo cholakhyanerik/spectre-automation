@@ -8,11 +8,9 @@ use enigo::{Enigo, Mouse, Settings, Button, Direction, Coordinate};
 /// На Windows/Linux это прямой запуск бинарного файла.
 /// На macOS, если указан бандл `.app`, запускаем вложенный исполняемый файл
 /// напрямую (через `open` нельзя получить PID процесса для мониторинга).
-pub fn run_app(path: &str) -> Child {
+pub fn run_app(path: &str) -> std::io::Result<Child> {
     let exec_path = resolve_executable(path);
-    Command::new(&exec_path)
-        .spawn()
-        .unwrap_or_else(|e| panic!("Не удалось запустить приложение '{}': {}", exec_path, e))
+    Command::new(&exec_path).spawn()
 }
 
 /// Преобразует путь к macOS-бандлу `Foo.app` в путь к реальному бинарю внутри него.
@@ -34,20 +32,37 @@ fn resolve_executable(path: &str) -> String {
     path.to_string()
 }
 
-/// Эмулирует пользовательский сценарий взаимодействия с GUI
+/// Эмулирует пользовательский сценарий взаимодействия с GUI.
+///
+/// Координаты кликов берутся ОТНОСИТЕЛЬНО размера основного дисплея, а не
+/// захардкоженными пикселями — так сценарий не зависит от разрешения экрана.
+/// Ошибки ввода не роняют процесс (мониторинг важнее сценария): в худшем
+/// случае клик пропускается, но замер метрик продолжается.
 pub fn execute_ui_scenario() {
     // Даем приложению открыться
     thread::sleep(Duration::from_secs(2));
 
-    let mut enigo = Enigo::new(&Settings::default()).unwrap();
+    let mut enigo = match Enigo::new(&Settings::default()) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("⚠️  Не удалось инициализировать управление вводом: {e}. Сценарий UI пропущен.");
+            return;
+        }
+    };
 
-    // Клик 1: Имитируем переход по меню
-    enigo.move_mouse(300, 200, Coordinate::Abs).unwrap();
-    enigo.button(Button::Left, Direction::Click).unwrap();
+    // Размер основного дисплея (с разумным запасным вариантом).
+    let (w, h) = enigo.main_display().unwrap_or((1920, 1080));
+    let point = |fx: f32, fy: f32| ((w as f32 * fx) as i32, (h as f32 * fy) as i32);
+
+    // Клик 1: Имитируем переход по меню (верхняя левая четверть).
+    let (x1, y1) = point(0.30, 0.25);
+    let _ = enigo.move_mouse(x1, y1, Coordinate::Abs);
+    let _ = enigo.button(Button::Left, Direction::Click);
     thread::sleep(Duration::from_millis(500));
 
-    // Клик 2: Имитируем запуск тяжелой задачи для теста производительности
-    enigo.move_mouse(500, 400, Coordinate::Abs).unwrap();
-    enigo.button(Button::Left, Direction::Click).unwrap();
+    // Клик 2: Имитируем запуск тяжелой задачи (центр экрана).
+    let (x2, y2) = point(0.50, 0.50);
+    let _ = enigo.move_mouse(x2, y2, Coordinate::Abs);
+    let _ = enigo.button(Button::Left, Direction::Click);
     thread::sleep(Duration::from_secs(2));
 }
