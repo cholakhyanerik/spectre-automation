@@ -117,7 +117,7 @@ async fn main() {
     println!("✅ Тест актуальной версии завершен.");
 
     // Сохраняем и выводим отчеты
-    report::print_visual_report("Actual Version", &result_new);
+    report::print_visual_report(&result_new);
     report::save_report_json("actual", &result_new);
     report::save_run_to_history(&result_new);
 
@@ -135,7 +135,7 @@ async fn main() {
         {
             println!("✅ Тест старой версии завершен.");
 
-            report::print_visual_report("Old Version", &result_old);
+            report::print_visual_report(&result_old);
             report::save_report_json("old", &result_old);
             report::save_run_to_history(&result_old);
 

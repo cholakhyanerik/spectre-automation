@@ -3,8 +3,7 @@ use std::path::Path;
 use plotters::prelude::*;
 use chrono::Local;
 use serde::{Serialize, Deserialize};
-// MetricPoint удален из импортов для исправления предупреждения (unused import)
-use crate::monitor::TestResult; 
+use crate::monitor::TestResult;
 
 const DIR_CURRENT: &str = "reports/current";
 const DIR_HISTORY: &str = "reports/history";
@@ -20,21 +19,165 @@ const C_GPU: RGBColor = RGBColor(30, 136, 229); // синий
 const C_RAM: RGBColor = RGBColor(142, 36, 170); // фиолетовый
 const C_CPU_OLD: RGBColor = RGBColor(255, 152, 0); // оранжевый
 const C_GPU_OLD: RGBColor = RGBColor(0, 172, 193); // бирюзовый
+const C_RAM_OLD: RGBColor = RGBColor(186, 104, 200); // светло-фиолетовый
 const C_GRID_BG: RGBColor = RGBColor(248, 249, 250); // почти белый фон графика
+const C_HEADER_BG: RGBColor = RGBColor(33, 37, 41); // тёмная шапка
 const C_INK: RGBColor = RGBColor(33, 37, 41); // тёмный текст
 const C_MUTED: RGBColor = RGBColor(120, 124, 128); // приглушённый текст
+const C_LINE: RGBColor = RGBColor(225, 228, 232); // разделители
+const C_GOOD: RGBColor = RGBColor(46, 125, 50); // зелёный (стало лучше)
+const C_BAD: RGBColor = RGBColor(198, 40, 40); // красный (стало хуже)
 
+// ────────────────────────── Статистика ──────────────────────────
+
+/// Полный набор описательных статистик по одной метрике за прогон.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
+pub struct Stat {
+    pub min: f64,
+    pub avg: f64,
+    pub median: f64,
+    pub p95: f64,
+    pub max: f64,
+    /// Стандартное отклонение — насколько «дёргается» метрика во времени.
+    pub stddev: f64,
+}
+
+impl Stat {
+    fn from(values: &[f64]) -> Self {
+        if values.is_empty() {
+            return Self::default();
+        }
+        let n = values.len();
+        let avg = values.iter().sum::<f64>() / n as f64;
+
+        let variance = values.iter().map(|v| (v - avg).powi(2)).sum::<f64>() / n as f64;
+
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let median = if n % 2 == 0 {
+            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+        } else {
+            sorted[n / 2]
+        };
+
+        // Ближайший ранг: индекс = round(0.95 * (n - 1)).
+        let p95_idx = ((n - 1) as f64 * 0.95).round() as usize;
+
+        Self {
+            min: sorted[0],
+            avg,
+            median,
+            p95: sorted[p95_idx],
+            max: sorted[n - 1],
+            stddev: variance.sqrt(),
+        }
+    }
+}
+
+/// Все три метрики прогона, разложенные по статистикам.
+pub struct RunStats {
+    pub cpu: Stat,
+    pub gpu: Stat,
+    pub ram: Stat,
+    pub samples: usize,
+}
+
+fn compute_stats(result: &TestResult) -> RunStats {
+    let cpu: Vec<f64> = result.metrics.iter().map(|p| p.cpu.min(100.0) as f64).collect();
+    let gpu: Vec<f64> = result.metrics.iter().map(|p| p.gpu.min(100.0) as f64).collect();
+    let ram: Vec<f64> = result.metrics.iter().map(|p| p.ram_mb as f64).collect();
+
+    RunStats {
+        cpu: Stat::from(&cpu),
+        gpu: Stat::from(&gpu),
+        ram: Stat::from(&ram),
+        samples: result.metrics.len(),
+    }
+}
+
+// ────────────────────────── История прогонов ──────────────────────────
+
+/// Запись в сводной истории. Поля min/median/p95/stddev помечены `serde(default)`:
+/// без этого старые записи (где их нет) не распарсятся, а `save_run_to_history`
+/// молча заменит всю историю пустым вектором.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RunHistoryRecord {
     pub date_time: String,
     pub executable: String,
     pub duration_secs: u64,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub gpu_name: String,
+    #[serde(default)]
+    pub samples: usize,
+
+    #[serde(default)]
+    pub min_cpu: f32,
     pub avg_cpu: f32,
+    #[serde(default)]
+    pub median_cpu: f32,
+    #[serde(default)]
+    pub p95_cpu: f32,
     pub max_cpu: f32,
+    #[serde(default)]
+    pub stddev_cpu: f32,
+
+    #[serde(default)]
+    pub min_gpu: f32,
     pub avg_gpu: f32,
+    #[serde(default)]
+    pub median_gpu: f32,
+    #[serde(default)]
+    pub p95_gpu: f32,
     pub max_gpu: f32,
+    #[serde(default)]
+    pub stddev_gpu: f32,
+
+    #[serde(default)]
+    pub min_ram_mb: f64,
     pub avg_ram_mb: f64,
+    #[serde(default)]
+    pub median_ram_mb: f64,
+    #[serde(default)]
+    pub p95_ram_mb: f64,
     pub max_ram_mb: u64,
+    #[serde(default)]
+    pub stddev_ram_mb: f64,
+}
+
+fn build_history_record(result: &TestResult) -> RunHistoryRecord {
+    let s = compute_stats(result);
+    RunHistoryRecord {
+        date_time: result.timestamp.clone(),
+        executable: result.exe_name.clone(),
+        duration_secs: result.duration_secs,
+        platform: result.platform.clone(),
+        gpu_name: result.gpu_name.clone(),
+        samples: s.samples,
+
+        min_cpu: s.cpu.min as f32,
+        avg_cpu: s.cpu.avg as f32,
+        median_cpu: s.cpu.median as f32,
+        p95_cpu: s.cpu.p95 as f32,
+        max_cpu: s.cpu.max as f32,
+        stddev_cpu: s.cpu.stddev as f32,
+
+        min_gpu: s.gpu.min as f32,
+        avg_gpu: s.gpu.avg as f32,
+        median_gpu: s.gpu.median as f32,
+        p95_gpu: s.gpu.p95 as f32,
+        max_gpu: s.gpu.max as f32,
+        stddev_gpu: s.gpu.stddev as f32,
+
+        min_ram_mb: s.ram.min,
+        avg_ram_mb: s.ram.avg,
+        median_ram_mb: s.ram.median,
+        p95_ram_mb: s.ram.p95,
+        max_ram_mb: s.ram.max as u64,
+        stddev_ram_mb: s.ram.stddev,
+    }
 }
 
 pub fn init_reports_dir() {
@@ -46,38 +189,15 @@ pub fn init_reports_dir() {
         let _ = fs::remove_dir_all(current_path);
     }
     fs::create_dir_all(current_path).expect("Не удалось создать директорию reports/current");
-    
+
     // 2. Создаем history, если её нет (не очищаем, она хранит историю!)
     if !history_path.exists() {
         fs::create_dir_all(history_path).expect("Не удалось создать директорию reports/history");
     }
 }
 
-fn calculate_history_record(result: &TestResult) -> RunHistoryRecord {
-    let count = result.metrics.len() as f32;
-    let avg_cpu = if count > 0.0 { (result.metrics.iter().map(|p| p.cpu).sum::<f32>() / count).min(100.0) } else { 0.0 };
-    let avg_gpu = if count > 0.0 { (result.metrics.iter().map(|p| p.gpu).sum::<f32>() / count).min(100.0) } else { 0.0 };
-    let avg_ram = if count > 0.0 { result.metrics.iter().map(|p| p.ram_mb as f64).sum::<f64>() / count as f64 } else { 0.0 };
-
-    let max_cpu = result.metrics.iter().map(|p| p.cpu).fold(0.0f32, |a, b| a.max(b)).min(100.0);
-    let max_gpu = result.metrics.iter().map(|p| p.gpu).fold(0.0f32, |a, b| a.max(b)).min(100.0);
-    let max_ram = result.metrics.iter().map(|p| p.ram_mb).max().unwrap_or(0);
-
-    RunHistoryRecord {
-        date_time: result.timestamp.clone(),
-        executable: result.exe_name.clone(),
-        duration_secs: result.duration_secs,
-        avg_cpu,
-        max_cpu,
-        avg_gpu,
-        max_gpu,
-        avg_ram_mb: avg_ram,
-        max_ram_mb: max_ram,
-    }
-}
-
 pub fn save_run_to_history(result: &TestResult) {
-    let record = calculate_history_record(result);
+    let record = build_history_record(result);
     let mut history: Vec<RunHistoryRecord> = vec![];
 
     // Читаем существующую историю, если файл есть
@@ -114,130 +234,422 @@ pub fn save_report_json(version_name: &str, result: &TestResult) {
     println!("💾 Сырые данные сохранены в: {}", filename);
 }
 
-pub fn print_visual_report(title: &str, result: &TestResult) {
-    let data = &result.metrics;
-    if data.is_empty() { return; }
-    
-    let record = calculate_history_record(result);
+// ────────────────────────── Консольные отчёты ──────────────────────────
+
+const COL_M: usize = 22; // ширина колонки названия метрики
+const COL_V: usize = 11; // ширина колонки значения
+
+/// Полная внутренняя ширина таблицы (между внешними рамками).
+const TABLE_W: usize = COL_M + 2 + (COL_V + 2) * 5 + 5;
+
+fn rule(left: &str, mid: &str, right: &str) -> String {
+    let m = "─".repeat(COL_M + 2);
+    let v = "─".repeat(COL_V + 2);
+    format!("{left}{m}{mid}{v}{mid}{v}{mid}{v}{mid}{v}{mid}{v}{right}")
+}
+
+fn banner(left: &str, right: &str) -> String {
+    format!("{left}{}{right}", "─".repeat(TABLE_W))
+}
+
+fn banner_row(text: &str) -> String {
+    format!("│{:<w$}│", format!(" {}", text), w = TABLE_W)
+}
+
+/// Строка таблицы: название метрики + пять значений.
+fn stat_row(label: &str, s: &Stat, unit: &str, decimals: usize) -> String {
+    let f = |v: f64| format!("{:.*}{}", decimals, v, unit);
+    format!(
+        "│ {:<m$} │ {:>v$} │ {:>v$} │ {:>v$} │ {:>v$} │ {:>v$} │",
+        label,
+        f(s.min),
+        f(s.avg),
+        f(s.median),
+        f(s.p95),
+        f(s.max),
+        m = COL_M,
+        v = COL_V,
+    )
+}
+
+pub fn print_visual_report(result: &TestResult) {
+    if result.metrics.is_empty() {
+        return;
+    }
+    let s = compute_stats(result);
 
     let platform = if result.platform.is_empty() { "—" } else { result.platform.as_str() };
     let gpu_name = if result.gpu_name.is_empty() { "—" } else { result.gpu_name.as_str() };
 
-    println!("\n┌─────────────────────────────────────────────────────────┐");
-    println!("│ 📊 PERFORMANCE REPORT: {:<32} │", title.to_uppercase());
-    println!("├─────────────────────────────────────────────────────────┤");
-    println!("│ Исполняемый файл: {:<37} │", record.executable);
-    println!("│ Платформа: {:<44} │", platform);
-    println!("│ GPU: {:<50} │", gpu_name);
-    println!("│ Дата запуска: {:<41} │", record.date_time);
-    println!("│ Продолжительность: {:<2} сек                               │", record.duration_secs);
-    println!("├───────────────────────┬────────────────┬────────────────┤");
-    println!("│ РЕСУРСЫ               │ СРЕДНЕЕ        │ ПИКОВОЕ (MAX)  │");
-    println!("├───────────────────────┼────────────────┼────────────────┤");
-    println!("│ 🖥️  CPU Usage         │ {:>12.2}% │ {:>12.2}% │", record.avg_cpu, record.max_cpu);
-    println!("│ 🎮 GPU Usage         │ {:>12.2}% │ {:>12.2}% │", record.avg_gpu, record.max_gpu);
-    println!("│ 💾 RAM Allocation    │ {:>11.1} MB │ {:>11} MB │", record.avg_ram_mb, record.max_ram_mb);
-    println!("└───────────────────────┴────────────────┴────────────────┘\n");
+    println!();
+    println!("{}", banner("┌", "┐"));
+    println!("{}", banner_row(&format!("PERFORMANCE REPORT — {}", result.exe_name)));
+    println!("{}", banner("├", "┤"));
+    println!("{}", banner_row(&format!("Платформа: {}   GPU: {}", platform, gpu_name)));
+    println!(
+        "{}",
+        banner_row(&format!(
+            "Запуск: {}   Длительность: {} сек   Замеров: {}",
+            result.timestamp, result.duration_secs, s.samples
+        ))
+    );
+    println!("{}", rule("├", "┬", "┤"));
+    println!(
+        "│ {:<m$} │ {:>v$} │ {:>v$} │ {:>v$} │ {:>v$} │ {:>v$} │",
+        "РЕСУРС", "МИН", "СРЕДНЕЕ", "МЕДИАНА", "P95", "ПИК (MAX)",
+        m = COL_M,
+        v = COL_V,
+    );
+    println!("{}", rule("├", "┼", "┤"));
+    println!("{}", stat_row("CPU Usage", &s.cpu, "%", 2));
+    println!("{}", stat_row("GPU Usage", &s.gpu, "%", 2));
+    println!("{}", stat_row("RAM Allocation", &s.ram, " MB", 0));
+    println!("{}", rule("└", "┴", "┘"));
+    println!(
+        "  Разброс (σ):  CPU {:.2}%   GPU {:.2}%   RAM {:.1} MB",
+        s.cpu.stddev, s.gpu.stddev, s.ram.stddev
+    );
+    println!();
+}
+
+/// Форматирует дельту с ANSI-цветом: рост потребления — красный, снижение — зелёный.
+/// Цвет накладывается ПОСЛЕ выравнивания, иначе escape-последовательности
+/// съедают ширину колонки.
+fn colored_diff(val: f64, unit: &str, width: usize) -> String {
+    let sign = if val > 0.0 { "+" } else { "" };
+    let padded = format!("{:>width$}", format!("{}{:.2}{}", sign, val, unit));
+
+    if val > 0.0 {
+        format!("\x1b[31m{}\x1b[0m", padded)
+    } else if val < 0.0 {
+        format!("\x1b[32m{}\x1b[0m", padded)
+    } else {
+        padded
+    }
+}
+
+/// Относительное изменение в процентах. `None`, если базовое значение нулевое.
+fn percent_change(new: f64, old: f64) -> Option<f64> {
+    if old.abs() < f64::EPSILON {
+        None
+    } else {
+        Some((new - old) / old * 100.0)
+    }
+}
+
+fn fmt_pct_change(new: f64, old: f64, width: usize) -> String {
+    match percent_change(new, old) {
+        Some(p) => {
+            let sign = if p > 0.0 { "+" } else { "" };
+            let padded = format!("{:>width$}", format!("{}{:.1}%", sign, p));
+            if p > 0.0 {
+                format!("\x1b[31m{}\x1b[0m", padded)
+            } else if p < 0.0 {
+                format!("\x1b[32m{}\x1b[0m", padded)
+            } else {
+                padded
+            }
+        }
+        None => format!("{:>width$}", "—"),
+    }
+}
+
+/// Обрезает имя до `max` символов, чтобы длинный exe не ломал вёрстку таблицы.
+fn truncate(name: &str, max: usize) -> String {
+    if name.chars().count() <= max {
+        name.to_string()
+    } else {
+        let cut: String = name.chars().take(max.saturating_sub(1)).collect();
+        format!("{}…", cut)
+    }
+}
+
+pub fn print_comparison_report(new_res: &TestResult, old_res: &TestResult) {
+    if new_res.metrics.is_empty() || old_res.metrics.is_empty() {
+        return;
+    }
+
+    let sn = compute_stats(new_res);
+    let so = compute_stats(old_res);
+
+    const CM: usize = 22; // метрика
+    const CV: usize = 15; // значение версии
+    const CD: usize = 13; // дельта
+    const CP: usize = 10; // дельта в %
+    let inner = CM + 2 + CV + 2 + CV + 2 + CD + 2 + CP + 2 + 4;
+
+    let name_new = truncate(&new_res.exe_name, CV);
+    let name_old = truncate(&old_res.exe_name, CV);
+
+    let line = |l: &str, m: &str, r: &str| {
+        format!(
+            "{l}{}{m}{}{m}{}{m}{}{m}{}{r}",
+            "─".repeat(CM + 2),
+            "─".repeat(CV + 2),
+            "─".repeat(CV + 2),
+            "─".repeat(CD + 2),
+            "─".repeat(CP + 2),
+        )
+    };
+
+    println!();
+    println!("┌{}┐", "─".repeat(inner));
+    println!("│{:<w$}│", format!(" COMPARISON REPORT — {} vs {}", name_new, name_old), w = inner);
+    println!("{}", line("├", "┬", "┤"));
+    println!(
+        "│ {:<CM$} │ {:>CV$} │ {:>CV$} │ {:>CD$} │ {:>CP$} │",
+        "РЕСУРС (среднее)", name_new, name_old, "РАЗНИЦА (Δ)", "Δ %",
+    );
+    println!("{}", line("├", "┼", "┤"));
+
+    let rows: [(&str, f64, f64, &str, usize); 3] = [
+        ("CPU Usage", sn.cpu.avg, so.cpu.avg, "%", 2),
+        ("GPU Usage", sn.gpu.avg, so.gpu.avg, "%", 2),
+        ("RAM Allocation", sn.ram.avg, so.ram.avg, " MB", 1),
+    ];
+
+    for (label, new_v, old_v, unit, dec) in rows {
+        println!(
+            "│ {:<CM$} │ {:>CV$} │ {:>CV$} │ {} │ {} │",
+            label,
+            format!("{:.*}{}", dec, new_v, unit),
+            format!("{:.*}{}", dec, old_v, unit),
+            colored_diff(new_v - old_v, unit, CD),
+            fmt_pct_change(new_v, old_v, CP),
+        );
+    }
+
+    println!("{}", line("├", "┼", "┤"));
+
+    // Пиковые значения — отдельным блоком: регрессия часто видна только в пике.
+    let peaks: [(&str, f64, f64, &str, usize); 3] = [
+        ("CPU пик (max)", sn.cpu.max, so.cpu.max, "%", 2),
+        ("GPU пик (max)", sn.gpu.max, so.gpu.max, "%", 2),
+        ("RAM пик (max)", sn.ram.max, so.ram.max, " MB", 1),
+    ];
+
+    for (label, new_v, old_v, unit, dec) in peaks {
+        println!(
+            "│ {:<CM$} │ {:>CV$} │ {:>CV$} │ {} │ {} │",
+            label,
+            format!("{:.*}{}", dec, new_v, unit),
+            format!("{:.*}{}", dec, old_v, unit),
+            colored_diff(new_v - old_v, unit, CD),
+            fmt_pct_change(new_v, old_v, CP),
+        );
+    }
+
+    println!("{}", line("└", "┴", "┘"));
+    println!("  Красным — рост потребления, зелёным — снижение.");
+    println!();
+}
+
+// ────────────────────────── Графики ──────────────────────────
+
+/// Рисует тёмную шапку отчёта: имя бинаря + контекст окружения.
+fn draw_header<DB: DrawingBackend>(
+    area: &DrawingArea<DB, plotters::coord::Shift>,
+    title: &str,
+    subtitle: &str,
+) -> ChartResult
+where
+    DB::ErrorType: 'static,
+{
+    let (w, h) = area.dim_in_pixel();
+    area.fill(&C_HEADER_BG)?;
+    area.draw(&Text::new(
+        title.to_string(),
+        (28, 14),
+        ("sans-serif", 22).into_font().style(FontStyle::Bold).color(&WHITE),
+    ))?;
+    area.draw(&Text::new(
+        subtitle.to_string(),
+        (28, 42),
+        ("sans-serif", 13).into_font().color(&RGBColor(170, 174, 178)),
+    ))?;
+    let _ = (w, h);
+    Ok(())
+}
+
+/// Заголовок сводной таблицы под графиками.
+fn draw_table_frame<DB: DrawingBackend>(
+    area: &DrawingArea<DB, plotters::coord::Shift>,
+    x0: i32,
+    x1: i32,
+) -> ChartResult
+where
+    DB::ErrorType: 'static,
+{
+    let (_, h) = area.dim_in_pixel();
+    let y1 = h as i32 - 14;
+    area.draw(&Rectangle::new([(x0, 8), (x1, y1)], Into::<ShapeStyle>::into(C_GRID_BG).filled()))?;
+    area.draw(&Rectangle::new([(x0, 8), (x1, y1)], Into::<ShapeStyle>::into(C_LINE).stroke_width(2)))?;
+    Ok(())
+}
+
+fn ram_upper_bound(values: &[f64]) -> f64 {
+    let max = values.iter().cloned().fold(0.0f64, f64::max);
+    if max <= 0.0 { 100.0 } else { max * 1.18 }
 }
 
 pub fn generate_single_chart(version_name: &str, result: &TestResult) -> ChartResult {
     let filename = format!("{}/chart_{}.png", DIR_CURRENT, version_name);
     let data = &result.metrics;
+    if data.is_empty() {
+        return Ok(());
+    }
+    let s = compute_stats(result);
 
-    let root = BitMapBackend::new(&filename, (900, 750)).into_drawing_area();
+    let root = BitMapBackend::new(&filename, (1000, 920)).into_drawing_area();
     root.fill(&WHITE)?;
 
-    let record = calculate_history_record(result);
-    let (upper, lower) = root.split_vertically(460);
+    let (header, rest) = root.split_vertically(70);
+    let (load_area, rest2) = rest.split_vertically(370);
+    let (ram_area, table_area) = rest2.split_vertically(250);
 
-    let mut chart = ChartBuilder::on(&upper)
+    let platform = if result.platform.is_empty() { "—" } else { result.platform.as_str() };
+    let gpu_name = if result.gpu_name.is_empty() { "—" } else { result.gpu_name.as_str() };
+
+    draw_header(
+        &header,
+        &format!("PERFORMANCE REPORT  —  {}", result.exe_name),
+        &format!(
+            "{}   |   GPU: {}   |   {}   |   {} сек, {} замеров",
+            platform, gpu_name, result.timestamp, result.duration_secs, s.samples
+        ),
+    )?;
+
+    // ── График нагрузки CPU / GPU ──
+    let mut chart = ChartBuilder::on(&load_area)
         .caption(
-            format!("Профиль: {} ({})", version_name.to_uppercase(), result.exe_name),
-            ("sans-serif", 24).into_font().style(FontStyle::Bold).color(&C_INK),
+            "Нагрузка CPU / GPU",
+            ("sans-serif", 17).into_font().style(FontStyle::Bold).color(&C_INK),
         )
-        .margin(20)
-        .x_label_area_size(40)
-        .y_label_area_size(45)
+        .margin(18)
+        .margin_top(8)
+        .x_label_area_size(38)
+        .y_label_area_size(48)
         .build_cartesian_2d(0..data.len() + 1, 0.0f32..100.0f32)?;
 
-    // Лёгкий фон области построения
     chart.plotting_area().fill(&C_GRID_BG)?;
-
     chart
         .configure_mesh()
         .x_desc("Время (сек)")
         .y_desc("Нагрузка (%)")
-        .axis_desc_style(("sans-serif", 15).into_font().color(&C_MUTED))
-        .label_style(("sans-serif", 12).into_font().color(&C_MUTED))
+        .y_label_formatter(&|v| format!("{:.0}", v))
+        .axis_desc_style(("sans-serif", 13).into_font().color(&C_MUTED))
+        .label_style(("sans-serif", 11).into_font().color(&C_MUTED))
         .light_line_style(WHITE.mix(0.0))
-        .bold_line_style(RGBColor(225, 228, 232))
+        .bold_line_style(C_LINE)
         .draw()?;
 
-    // Заливка области под линиями + сами линии (CPU, GPU)
-    chart.draw_series(AreaSeries::new(
-        data.iter().map(|p| (p.second, p.cpu)),
-        0.0,
-        C_CPU.mix(0.12),
-    ))?;
+    chart.draw_series(AreaSeries::new(data.iter().map(|p| (p.second, p.cpu)), 0.0, C_CPU.mix(0.10)))?;
     chart
-        .draw_series(LineSeries::new(
-            data.iter().map(|p| (p.second, p.cpu)),
-            C_CPU.stroke_width(3),
-        ))?
+        .draw_series(LineSeries::new(data.iter().map(|p| (p.second, p.cpu)), C_CPU.stroke_width(3)))?
         .label("CPU (%)")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_CPU.stroke_width(3)));
 
-    chart.draw_series(AreaSeries::new(
-        data.iter().map(|p| (p.second, p.gpu)),
-        0.0,
-        C_GPU.mix(0.12),
-    ))?;
+    chart.draw_series(AreaSeries::new(data.iter().map(|p| (p.second, p.gpu)), 0.0, C_GPU.mix(0.10)))?;
     chart
-        .draw_series(LineSeries::new(
-            data.iter().map(|p| (p.second, p.gpu)),
-            C_GPU.stroke_width(3),
-        ))?
+        .draw_series(LineSeries::new(data.iter().map(|p| (p.second, p.gpu)), C_GPU.stroke_width(3)))?
         .label("GPU (%)")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_GPU.stroke_width(3)));
+
+    // Пунктир среднего CPU — глазу сразу видно, где базовая линия.
+    chart.draw_series(LineSeries::new(
+        (0..=data.len()).map(|x| (x, s.cpu.avg as f32)),
+        C_CPU.mix(0.55).stroke_width(1),
+    ))?;
 
     chart
         .configure_series_labels()
         .background_style(WHITE.mix(0.9))
-        .border_style(RGBColor(225, 228, 232))
-        .label_font(("sans-serif", 13).into_font().color(&C_INK))
+        .border_style(C_LINE)
+        .label_font(("sans-serif", 12).into_font().color(&C_INK))
         .draw()?;
 
-    lower.draw(&Rectangle::new([(40, 10), (860, 280)], Into::<ShapeStyle>::into(C_GRID_BG).filled()))?;
-    lower.draw(&Rectangle::new([(40, 10), (860, 280)], Into::<ShapeStyle>::into(RGBColor(225, 228, 232)).stroke_width(2)))?;
-    let font_title = ("sans-serif", 18).into_font().style(FontStyle::Bold);
-    let font_header = ("sans-serif", 14).into_font().style(FontStyle::Bold);
-    let font_normal = ("sans-serif", 14).into_font();
+    // ── График RAM (собственная ось в MB) ──
+    let ram_vals: Vec<f64> = data.iter().map(|p| p.ram_mb as f64).collect();
+    let ram_max = ram_upper_bound(&ram_vals);
 
-    lower.draw(&Text::new("📊 SUMMARY REPORT", (60, 25), font_title.color(&C_INK)))?;
-    lower.draw(&Text::new(format!("Дата: {}", record.date_time), (560, 25), font_normal.clone().color(&C_MUTED)))?;
+    let mut ram_chart = ChartBuilder::on(&ram_area)
+        .caption(
+            "Потребление RAM",
+            ("sans-serif", 17).into_font().style(FontStyle::Bold).color(&C_INK),
+        )
+        .margin(18)
+        .margin_top(8)
+        .x_label_area_size(38)
+        .y_label_area_size(58)
+        .build_cartesian_2d(0..data.len() + 1, 0.0f64..ram_max)?;
 
-    // Контекст окружения
-    let platform = if result.platform.is_empty() { "—" } else { result.platform.as_str() };
-    let gpu_name = if result.gpu_name.is_empty() { "—" } else { result.gpu_name.as_str() };
-    lower.draw(&Text::new(format!("Платформа: {}    GPU: {}", platform, gpu_name), (60, 55), font_normal.clone().color(&C_MUTED)))?;
+    ram_chart.plotting_area().fill(&C_GRID_BG)?;
+    ram_chart
+        .configure_mesh()
+        .x_desc("Время (сек)")
+        .y_desc("Память (MB)")
+        .y_label_formatter(&|v| format!("{:.0}", v))
+        .axis_desc_style(("sans-serif", 13).into_font().color(&C_MUTED))
+        .label_style(("sans-serif", 11).into_font().color(&C_MUTED))
+        .light_line_style(WHITE.mix(0.0))
+        .bold_line_style(C_LINE)
+        .draw()?;
 
-    lower.draw(&Text::new("РЕСУРСЫ", (80, 95), font_header.color(&C_INK)))?;
-    lower.draw(&Text::new("СРЕДНЕЕ ЗНАЧЕНИЕ", (320, 95), font_header.color(&C_INK)))?;
-    lower.draw(&Text::new("ПИКОВОЕ (MAX)", (620, 95), font_header.color(&C_INK)))?;
+    ram_chart.draw_series(AreaSeries::new(
+        data.iter().map(|p| (p.second, p.ram_mb as f64)),
+        0.0,
+        C_RAM.mix(0.12),
+    ))?;
+    ram_chart
+        .draw_series(LineSeries::new(
+            data.iter().map(|p| (p.second, p.ram_mb as f64)),
+            C_RAM.stroke_width(3),
+        ))?
+        .label("RAM (MB)")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_RAM.stroke_width(3)));
 
-    lower.draw(&PathElement::new(vec![(50, 118), (850, 118)], RGBColor(225, 228, 232)))?;
+    ram_chart
+        .configure_series_labels()
+        .background_style(WHITE.mix(0.9))
+        .border_style(C_LINE)
+        .label_font(("sans-serif", 12).into_font().color(&C_INK))
+        .draw()?;
 
-    lower.draw(&Text::new("🖥️  CPU Usage", (80, 138), font_normal.clone().color(&C_INK)))?;
-    lower.draw(&Text::new(format!("{:.2} %", record.avg_cpu), (320, 138), font_normal.clone().color(&C_CPU)))?;
-    lower.draw(&Text::new(format!("{:.2} %", record.max_cpu), (620, 138), font_normal.clone().color(&C_CPU)))?;
+    // ── Сводная таблица: MIN / AVG / MEDIAN / P95 / MAX / σ ──
+    draw_table_frame(&table_area, 30, 970)?;
 
-    lower.draw(&Text::new("🎮  GPU Usage", (80, 178), font_normal.clone().color(&C_INK)))?;
-    lower.draw(&Text::new(format!("{:.2} %", record.avg_gpu), (320, 178), font_normal.clone().color(&C_GPU)))?;
-    lower.draw(&Text::new(format!("{:.2} %", record.max_gpu), (620, 178), font_normal.clone().color(&C_GPU)))?;
+    let f_title = ("sans-serif", 15).into_font().style(FontStyle::Bold);
+    let f_head = ("sans-serif", 12).into_font().style(FontStyle::Bold);
+    let f_norm = ("sans-serif", 13).into_font();
 
-    lower.draw(&Text::new("💾  RAM Allocation", (80, 218), font_normal.clone().color(&C_INK)))?;
-    lower.draw(&Text::new(format!("{:.1} MB", record.avg_ram_mb), (320, 218), font_normal.clone().color(&C_RAM)))?;
-    lower.draw(&Text::new(format!("{} MB", record.max_ram_mb), (620, 218), font_normal.clone().color(&C_RAM)))?;
+    table_area.draw(&Text::new("SUMMARY", (52, 22), f_title.color(&C_INK)))?;
+
+    // Колонки: подпись + 6 числовых
+    let cols = [52, 250, 372, 494, 616, 738, 862];
+    let heads = ["РЕСУРС", "МИН", "СРЕДНЕЕ", "МЕДИАНА", "P95", "ПИК (MAX)", "РАЗБРОС σ"];
+    for (x, h) in cols.iter().zip(heads) {
+        table_area.draw(&Text::new(h, (*x, 56), f_head.clone().color(&C_MUTED)))?;
+    }
+    table_area.draw(&PathElement::new(vec![(44, 78), (956, 78)], C_LINE))?;
+
+    let rows: [(&str, &Stat, &RGBColor, &str, usize); 3] = [
+        ("CPU Usage", &s.cpu, &C_CPU, "%", 2),
+        ("GPU Usage", &s.gpu, &C_GPU, "%", 2),
+        ("RAM Allocation", &s.ram, &C_RAM, " MB", 0),
+    ];
+
+    for (i, (label, st, color, unit, dec)) in rows.iter().enumerate() {
+        let y = 100 + i as i32 * 38;
+        table_area.draw(&Text::new(*label, (cols[0], y), f_norm.clone().color(&C_INK)))?;
+        let vals = [st.min, st.avg, st.median, st.p95, st.max, st.stddev];
+        for (j, v) in vals.iter().enumerate() {
+            table_area.draw(&Text::new(
+                format!("{:.*}{}", dec, v, unit),
+                (cols[j + 1], y),
+                f_norm.clone().color(*color),
+            ))?;
+        }
+    }
 
     root.present()?; // Принудительно завершаем отрисовку
     println!("📈 График сохранен в: {}", filename);
@@ -249,130 +661,189 @@ pub fn generate_comparison_chart(new_res: &TestResult, old_res: &TestResult) -> 
 
     let new_data = &new_res.metrics;
     let old_data = &old_res.metrics;
+    if new_data.is_empty() || old_data.is_empty() {
+        return Ok(());
+    }
 
-    let root = BitMapBackend::new(&filename, (1024, 850)).into_drawing_area();
+    let sn = compute_stats(new_res);
+    let so = compute_stats(old_res);
+
+    let root = BitMapBackend::new(&filename, (1180, 990)).into_drawing_area();
     root.fill(&WHITE)?;
 
-    let max_len = new_data.len().max(old_data.len());
-    let (upper, lower) = root.split_vertically(530);
+    let (header, rest) = root.split_vertically(70);
+    let (load_area, rest2) = rest.split_vertically(390);
+    let (ram_area, table_area) = rest2.split_vertically(250);
 
-    let mut chart = ChartBuilder::on(&upper)
-        .caption("Сравнение версий", ("sans-serif", 28).into_font().style(FontStyle::Bold).color(&C_INK))
-        .margin(20)
-        .x_label_area_size(40)
-        .y_label_area_size(45)
+    let platform = if new_res.platform.is_empty() { "—" } else { new_res.platform.as_str() };
+    let gpu_name = if new_res.gpu_name.is_empty() { "—" } else { new_res.gpu_name.as_str() };
+
+    draw_header(
+        &header,
+        &format!("COMPARISON  —  {}  vs  {}", new_res.exe_name, old_res.exe_name),
+        &format!(
+            "{}   |   GPU: {}   |   {}   |   {} сек",
+            platform, gpu_name, new_res.timestamp, new_res.duration_secs
+        ),
+    )?;
+
+    let max_len = new_data.len().max(old_data.len());
+
+    // ── CPU / GPU обеих версий ──
+    let mut chart = ChartBuilder::on(&load_area)
+        .caption(
+            "Нагрузка CPU / GPU",
+            ("sans-serif", 17).into_font().style(FontStyle::Bold).color(&C_INK),
+        )
+        .margin(18)
+        .margin_top(8)
+        .x_label_area_size(38)
+        .y_label_area_size(48)
         .build_cartesian_2d(0..max_len + 1, 0.0f32..100.0f32)?;
 
     chart.plotting_area().fill(&C_GRID_BG)?;
-
     chart
         .configure_mesh()
         .x_desc("Время (сек)")
         .y_desc("Использование (%)")
-        .axis_desc_style(("sans-serif", 15).into_font().color(&C_MUTED))
-        .label_style(("sans-serif", 12).into_font().color(&C_MUTED))
+        .y_label_formatter(&|v| format!("{:.0}", v))
+        .axis_desc_style(("sans-serif", 13).into_font().color(&C_MUTED))
+        .label_style(("sans-serif", 11).into_font().color(&C_MUTED))
         .light_line_style(WHITE.mix(0.0))
-        .bold_line_style(RGBColor(225, 228, 232))
+        .bold_line_style(C_LINE)
         .draw()?;
 
-    chart.draw_series(LineSeries::new(new_data.iter().map(|p| (p.second, p.cpu)), C_CPU.stroke_width(3)))?
-        .label("CPU (Актуальная)").legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_CPU.stroke_width(3)));
-    chart.draw_series(LineSeries::new(old_data.iter().map(|p| (p.second, p.cpu)), C_CPU_OLD.stroke_width(2)))?
-        .label("CPU (Старая)").legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_CPU_OLD.stroke_width(2)));
-    chart.draw_series(LineSeries::new(new_data.iter().map(|p| (p.second, p.gpu)), C_GPU.stroke_width(3)))?
-        .label("GPU (Актуальная)").legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_GPU.stroke_width(3)));
-    chart.draw_series(LineSeries::new(old_data.iter().map(|p| (p.second, p.gpu)), C_GPU_OLD.stroke_width(2)))?
-        .label("GPU (Старая)").legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_GPU_OLD.stroke_width(2)));
+    chart
+        .draw_series(LineSeries::new(new_data.iter().map(|p| (p.second, p.cpu)), C_CPU.stroke_width(3)))?
+        .label(format!("CPU — {}", new_res.exe_name))
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_CPU.stroke_width(3)));
+    chart
+        .draw_series(LineSeries::new(old_data.iter().map(|p| (p.second, p.cpu)), C_CPU_OLD.stroke_width(2)))?
+        .label(format!("CPU — {}", old_res.exe_name))
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_CPU_OLD.stroke_width(2)));
+    chart
+        .draw_series(LineSeries::new(new_data.iter().map(|p| (p.second, p.gpu)), C_GPU.stroke_width(3)))?
+        .label(format!("GPU — {}", new_res.exe_name))
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_GPU.stroke_width(3)));
+    chart
+        .draw_series(LineSeries::new(old_data.iter().map(|p| (p.second, p.gpu)), C_GPU_OLD.stroke_width(2)))?
+        .label(format!("GPU — {}", old_res.exe_name))
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_GPU_OLD.stroke_width(2)));
 
     chart
         .configure_series_labels()
         .background_style(WHITE.mix(0.9))
-        .border_style(RGBColor(225, 228, 232))
-        .label_font(("sans-serif", 13).into_font().color(&C_INK))
+        .border_style(C_LINE)
+        .label_font(("sans-serif", 12).into_font().color(&C_INK))
         .draw()?;
 
-    let rec_new = calculate_history_record(new_res);
-    let rec_old = calculate_history_record(old_res);
+    // ── RAM обеих версий ──
+    let mut ram_vals: Vec<f64> = new_data.iter().map(|p| p.ram_mb as f64).collect();
+    ram_vals.extend(old_data.iter().map(|p| p.ram_mb as f64));
+    let ram_max = ram_upper_bound(&ram_vals);
 
-    let diff_cpu = rec_new.avg_cpu - rec_old.avg_cpu;
-    let diff_gpu = rec_new.avg_gpu - rec_old.avg_gpu;
-    let diff_ram = rec_new.avg_ram_mb - rec_old.avg_ram_mb;
+    let mut ram_chart = ChartBuilder::on(&ram_area)
+        .caption(
+            "Потребление RAM",
+            ("sans-serif", 17).into_font().style(FontStyle::Bold).color(&C_INK),
+        )
+        .margin(18)
+        .margin_top(8)
+        .x_label_area_size(38)
+        .y_label_area_size(58)
+        .build_cartesian_2d(0..max_len + 1, 0.0f64..ram_max)?;
 
-    lower.draw(&Rectangle::new([(40, 10), (984, 280)], Into::<ShapeStyle>::into(C_GRID_BG).filled()))?;
-    lower.draw(&Rectangle::new([(40, 10), (984, 280)], Into::<ShapeStyle>::into(RGBColor(225, 228, 232)).stroke_width(2)))?;
+    ram_chart.plotting_area().fill(&C_GRID_BG)?;
+    ram_chart
+        .configure_mesh()
+        .x_desc("Время (сек)")
+        .y_desc("Память (MB)")
+        .y_label_formatter(&|v| format!("{:.0}", v))
+        .axis_desc_style(("sans-serif", 13).into_font().color(&C_MUTED))
+        .label_style(("sans-serif", 11).into_font().color(&C_MUTED))
+        .light_line_style(WHITE.mix(0.0))
+        .bold_line_style(C_LINE)
+        .draw()?;
 
-    let font_title = ("sans-serif", 18).into_font().style(FontStyle::Bold);
-    let font_header = ("sans-serif", 14).into_font().style(FontStyle::Bold);
-    let font_normal = ("sans-serif", 14).into_font();
+    ram_chart
+        .draw_series(LineSeries::new(
+            new_data.iter().map(|p| (p.second, p.ram_mb as f64)),
+            C_RAM.stroke_width(3),
+        ))?
+        .label(format!("RAM — {}", new_res.exe_name))
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_RAM.stroke_width(3)));
+    ram_chart
+        .draw_series(LineSeries::new(
+            old_data.iter().map(|p| (p.second, p.ram_mb as f64)),
+            C_RAM_OLD.stroke_width(2),
+        ))?
+        .label(format!("RAM — {}", old_res.exe_name))
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], C_RAM_OLD.stroke_width(2)));
 
-    lower.draw(&Text::new("📊 COMPARISON SUMMARY REPORT", (60, 25), font_title.color(&C_INK)))?;
+    ram_chart
+        .configure_series_labels()
+        .background_style(WHITE.mix(0.9))
+        .border_style(C_LINE)
+        .label_font(("sans-serif", 12).into_font().color(&C_INK))
+        .draw()?;
 
-    // Контекст: платформа и GPU актуальной версии
-    let platform = if new_res.platform.is_empty() { "—" } else { new_res.platform.as_str() };
-    let gpu_name = if new_res.gpu_name.is_empty() { "—" } else { new_res.gpu_name.as_str() };
-    lower.draw(&Text::new(format!("Платформа: {}    GPU: {}", platform, gpu_name), (520, 25), font_normal.clone().color(&C_MUTED)))?;
+    // ── Сравнительная таблица ──
+    draw_table_frame(&table_area, 30, 1150)?;
 
-    lower.draw(&Text::new("РЕСУРСЫ", (80, 70), font_header.clone().color(&C_INK)))?;
-    lower.draw(&Text::new("АКТУАЛЬНАЯ ВЕРСИЯ", (320, 70), font_header.clone().color(&C_INK)))?;
-    lower.draw(&Text::new("СТАРАЯ ВЕРСИЯ", (560, 70), font_header.clone().color(&C_INK)))?;
-    lower.draw(&Text::new("РАЗНИЦА (Δ)", (800, 70), font_header.clone().color(&C_INK)))?;
+    let f_title = ("sans-serif", 15).into_font().style(FontStyle::Bold);
+    let f_head = ("sans-serif", 12).into_font().style(FontStyle::Bold);
+    let f_norm = ("sans-serif", 13).into_font();
 
-    lower.draw(&PathElement::new(vec![(50, 95), (974, 95)], RGBColor(225, 228, 232)))?;
+    table_area.draw(&Text::new("COMPARISON SUMMARY", (52, 20), f_title.color(&C_INK)))?;
 
-    let draw_row = |y: i32, title: &str, new_val: f64, old_val: f64, diff_val: f64, unit: &str| -> ChartResult {
-        lower.draw(&Text::new(title, (80, y), font_normal.clone().color(&C_INK)))?;
-        lower.draw(&Text::new(format!("{:.2} {}", new_val, unit), (320, y), font_normal.clone().color(&C_INK)))?;
-        lower.draw(&Text::new(format!("{:.2} {}", old_val, unit), (560, y), font_normal.clone().color(&C_INK)))?;
+    let cols = [52, 330, 530, 730, 900, 1030];
+    let heads = [
+        "РЕСУРС".to_string(),
+        truncate(&new_res.exe_name, 22),
+        truncate(&old_res.exe_name, 22),
+        "РАЗНИЦА (Δ)".to_string(),
+        "Δ %".to_string(),
+        "ВЕРДИКТ".to_string(),
+    ];
+    for (x, h) in cols.iter().zip(heads.iter()) {
+        table_area.draw(&Text::new(h.clone(), (*x, 52), f_head.clone().color(&C_MUTED)))?;
+    }
+    table_area.draw(&PathElement::new(vec![(44, 74), (1136, 74)], C_LINE))?;
 
-        let sign = if diff_val > 0.0 { "+" } else { "" };
-        let diff_text = format!("{}{:.2} {}", sign, diff_val, unit);
-        let color = if diff_val > 0.0 { &RED } else if diff_val < 0.0 { &GREEN } else { &C_INK };
-        lower.draw(&Text::new(diff_text, (800, y), font_normal.clone().color(color)))?;
-        Ok(())
-    };
+    // Средние и пиковые значения в одной таблице.
+    let rows: [(&str, f64, f64, &str, usize); 6] = [
+        ("CPU — среднее", sn.cpu.avg, so.cpu.avg, "%", 2),
+        ("CPU — пик (max)", sn.cpu.max, so.cpu.max, "%", 2),
+        ("GPU — среднее", sn.gpu.avg, so.gpu.avg, "%", 2),
+        ("GPU — пик (max)", sn.gpu.max, so.gpu.max, "%", 2),
+        ("RAM — среднее", sn.ram.avg, so.ram.avg, " MB", 1),
+        ("RAM — пик (max)", sn.ram.max, so.ram.max, " MB", 1),
+    ];
 
-    draw_row(120, "🖥️  CPU Usage", rec_new.avg_cpu as f64, rec_old.avg_cpu as f64, diff_cpu as f64, "%")?;
-    draw_row(170, "🎮  GPU Usage", rec_new.avg_gpu as f64, rec_old.avg_gpu as f64, diff_gpu as f64, "%")?;
-    draw_row(220, "💾  RAM Allocation", rec_new.avg_ram_mb, rec_old.avg_ram_mb, diff_ram, "MB")?;
+    for (i, (label, new_v, old_v, unit, dec)) in rows.iter().enumerate() {
+        let y = 94 + i as i32 * 30;
+        let diff = new_v - old_v;
+        let color = if diff > 0.0 { &C_BAD } else if diff < 0.0 { &C_GOOD } else { &C_INK };
+        let sign = if diff > 0.0 { "+" } else { "" };
+
+        table_area.draw(&Text::new(*label, (cols[0], y), f_norm.clone().color(&C_INK)))?;
+        table_area.draw(&Text::new(format!("{:.*}{}", dec, new_v, unit), (cols[1], y), f_norm.clone().color(&C_INK)))?;
+        table_area.draw(&Text::new(format!("{:.*}{}", dec, old_v, unit), (cols[2], y), f_norm.clone().color(&C_INK)))?;
+        table_area.draw(&Text::new(format!("{}{:.*}{}", sign, dec, diff, unit), (cols[3], y), f_norm.clone().color(color)))?;
+
+        let pct = match percent_change(*new_v, *old_v) {
+            Some(p) => format!("{}{:.1}%", if p > 0.0 { "+" } else { "" }, p),
+            None => "—".to_string(),
+        };
+        table_area.draw(&Text::new(pct, (cols[4], y), f_norm.clone().color(color)))?;
+
+        let verdict = if diff > 0.0 { "хуже" } else if diff < 0.0 { "лучше" } else { "без изм." };
+        table_area.draw(&Text::new(verdict, (cols[5], y), f_norm.clone().color(color)))?;
+    }
 
     root.present()?;
     println!("👉 Сводный сравнительный график сохранен в: {}", filename);
     Ok(())
-}
-
-pub fn print_comparison_report(new_res: &TestResult, old_res: &TestResult) {
-    if new_res.metrics.is_empty() || old_res.metrics.is_empty() { return; }
-
-    let rec_new = calculate_history_record(new_res);
-    let rec_old = calculate_history_record(old_res);
-
-    let diff_cpu = rec_new.avg_cpu - rec_old.avg_cpu;
-    let diff_gpu = rec_new.avg_gpu - rec_old.avg_gpu;
-    let diff_ram = rec_new.avg_ram_mb - rec_old.avg_ram_mb;
-
-    let format_diff = |val: f64, unit: &str| -> String {
-        let sign = if val > 0.0 { "+" } else { "" };
-        let text = format!("[{}{:.1}{}]", sign, val, unit);
-        let padded = format!("{:>12}", text); 
-        
-        if val > 0.0 { format!("\x1b[31m{}\x1b[0m", padded) } 
-        else if val < 0.0 { format!("\x1b[32m{}\x1b[0m", padded) } 
-        else { padded }
-    };
-
-    let diff_cpu_str = format_diff(diff_cpu as f64, "%");
-    let diff_gpu_str = format_diff(diff_gpu as f64, "%");
-    let diff_ram_str = format_diff(diff_ram, " MB");
-
-    println!("\n┌───────────────────────┬────────────────────┬─────────────────┬──────────────┐");
-    println!("│ 📊 COMPARISON REPORT: ACTUAL VS OLD                                         │");
-    println!("├───────────────────────┬────────────────────┬─────────────────┬──────────────┤");
-    println!("│ РЕСУРСЫ               │ АКТУАЛЬНАЯ ВЕРСИЯ  │ СТАРАЯ ВЕРСИЯ   │ РАЗНИЦА (Δ)  │");
-    println!("├───────────────────────┼────────────────────┼─────────────────┼──────────────┤");
-    println!("│ 🖥️  CPU Usage         │ {:>17.2}% │ {:>14.2}% │ {} │", rec_new.avg_cpu, rec_old.avg_cpu, diff_cpu_str);
-    println!("│ 🎮 GPU Usage         │ {:>17.2}% │ {:>14.2}% │ {} │", rec_new.avg_gpu, rec_old.avg_gpu, diff_gpu_str);
-    println!("│ 💾 RAM Allocation    │ {:>14.1} MB │ {:>11.1} MB │ {} │", rec_new.avg_ram_mb, rec_old.avg_ram_mb, diff_ram_str);
-    println!("└───────────────────────┴────────────────────┴─────────────────┴──────────────┘\n");
 }
 
 /// Функция для архивации всех отчетов из current в history с добавлением метки времени
