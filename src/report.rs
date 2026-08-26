@@ -22,6 +22,7 @@ const C_GPU_OLD: RGBColor = RGBColor(0, 172, 193); // бирюзовый
 const C_RAM_OLD: RGBColor = RGBColor(186, 104, 200); // светло-фиолетовый
 const C_GRID_BG: RGBColor = RGBColor(248, 249, 250); // почти белый фон графика
 const C_HEADER_BG: RGBColor = RGBColor(33, 37, 41); // тёмная шапка
+const C_HEADER_SUB: RGBColor = RGBColor(170, 174, 178); // подзаголовок на тёмной шапке
 const C_INK: RGBColor = RGBColor(33, 37, 41); // тёмный текст
 const C_MUTED: RGBColor = RGBColor(120, 124, 128); // приглушённый текст
 const C_LINE: RGBColor = RGBColor(225, 228, 232); // разделители
@@ -446,28 +447,107 @@ pub fn print_comparison_report(new_res: &TestResult, old_res: &TestResult) {
 
 // ────────────────────────── Графики ──────────────────────────
 
-/// Рисует тёмную шапку отчёта: имя бинаря + контекст окружения.
+/// Отступ текста шапки от левого края холста; столько же оставляется справа.
+const HEADER_PAD: i32 = 28;
+
+/// Предел для имени видеокарты в подзаголовке шапки. «NVIDIA GeForce RTX 4070
+/// Laptop GPU» — ровно 34 знака и проходит целиком; всё, что длиннее, режется,
+/// чтобы не вытолкнуть за край дату и число замеров, стоящие следом.
+const GPU_NAME_MAX: usize = 34;
+
+/// Разделитель между постоянной частью заголовка и именами.
+const HEADER_DASH: &str = "  —  ";
+/// Разделитель между двумя именами в заголовке сравнения.
+const HEADER_VS: &str = "  vs  ";
+
+/// Ширина строки в пикселях при данном шрифте.
+///
+/// Считает сам `plotters` — тем же перебором глифов с их шириной и кернингом,
+/// которым потом и рисует, так что это не оценка, а факт. Оценка по среднему
+/// знаку остаётся ровно на один случай: шрифт не нашёлся в системе. Тогда
+/// рисовать всё равно нечем, и приблизительная ширина хуже не сделает.
+fn text_width(text: &str, font: &FontDesc<'_>) -> u32 {
+    match font.box_size(text) {
+        Ok((w, _)) => w,
+        Err(_) => (text.chars().count() as f64 * font.get_size() * 0.6) as u32,
+    }
+}
+
+/// Обрезает строку так, чтобы она заняла не больше `max_w` пикселей.
+///
+/// В отличие от `truncate`, предел здесь в пикселях, а не в знаках: у кегля 22
+/// «W» втрое шире «i», и предел в знаках пришлось бы брать по самой широкой
+/// букве — то есть резать нормальные заголовки задолго до края холста.
+fn fit_to_width(text: &str, font: &FontDesc<'_>, max_w: u32) -> String {
+    if text_width(text, font) <= max_w {
+        return text.to_string();
+    }
+    // Ширина растёт от числа знаков монотонно, поэтому самый длинный
+    // влезающий префикс ищется двоичным поиском, а не перебором подряд.
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let candidate = format!("{}…", chars[..mid].iter().collect::<String>());
+        if text_width(&candidate, font) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    format!("{}…", chars[..lo].iter().collect::<String>())
+}
+
+/// Собирает заголовок шапки, ужимая имена бинарей под ширину холста.
+///
+/// Имена сюда приходят как есть — это названия веток и тикетов, они длинные, —
+/// а `plotters` рисует за границей холста молча: ни ошибки, ни предупреждения,
+/// просто пропадает то, ради чего отчёт открывают. Постоянная часть
+/// (`COMPARISON —`, `vs`) ширину не выбирает: она вычитается первой, а остаток
+/// делится между именами поровну. Обрезать уже собранную строку целиком
+/// нельзя — в сравнении первое длинное имя съело бы и «vs», и второе имя.
+fn header_title(prefix: &str, names: &[&str], font: &FontDesc<'_>, max_w: u32) -> String {
+    let mut skeleton = format!("{}{}", prefix, HEADER_DASH);
+    for _ in 1..names.len() {
+        skeleton.push_str(HEADER_VS);
+    }
+    let per_name = max_w.saturating_sub(text_width(&skeleton, font)) / names.len().max(1) as u32;
+
+    let fitted: Vec<String> = names.iter().map(|n| fit_to_width(n, font, per_name)).collect();
+    let title = format!("{}{}{}", prefix, HEADER_DASH, fitted.join(HEADER_VS));
+
+    // Вторая обрезка — уже по всей строке: на узком холсте не влезает и одна
+    // постоянная часть, и тогда делить между именами просто нечего.
+    fit_to_width(&title, font, max_w)
+}
+
+/// Рисует тёмную шапку отчёта: имена бинарей + контекст окружения.
 fn draw_header<DB: DrawingBackend>(
     area: &DrawingArea<DB, plotters::coord::Shift>,
-    title: &str,
+    prefix: &str,
+    names: &[&str],
     subtitle: &str,
 ) -> ChartResult
 where
     DB::ErrorType: 'static,
 {
-    let (w, h) = area.dim_in_pixel();
+    let (w, _) = area.dim_in_pixel();
+    let avail = (w as i32 - HEADER_PAD * 2).max(0) as u32;
+
+    let f_title = ("sans-serif", 22).into_font().style(FontStyle::Bold);
+    let f_sub = ("sans-serif", 13).into_font();
+
     area.fill(&C_HEADER_BG)?;
     area.draw(&Text::new(
-        title.to_string(),
-        (28, 14),
-        ("sans-serif", 22).into_font().style(FontStyle::Bold).color(&WHITE),
+        header_title(prefix, names, &f_title, avail),
+        (HEADER_PAD, 14),
+        f_title.color(&WHITE),
     ))?;
     area.draw(&Text::new(
-        subtitle.to_string(),
-        (28, 42),
-        ("sans-serif", 13).into_font().color(&RGBColor(170, 174, 178)),
+        fit_to_width(subtitle, &f_sub, avail),
+        (HEADER_PAD, 42),
+        f_sub.color(&C_HEADER_SUB),
     ))?;
-    let _ = (w, h);
     Ok(())
 }
 
@@ -508,11 +588,16 @@ pub fn generate_single_chart(version_name: &str, result: &TestResult) -> ChartRe
     let (ram_area, table_area) = rest2.split_vertically(250);
 
     let platform = if result.platform.is_empty() { "—" } else { result.platform.as_str() };
-    let gpu_name = if result.gpu_name.is_empty() { "—" } else { result.gpu_name.as_str() };
+    let gpu_name = if result.gpu_name.is_empty() {
+        "—".to_string()
+    } else {
+        truncate(&result.gpu_name, GPU_NAME_MAX)
+    };
 
     draw_header(
         &header,
-        &format!("PERFORMANCE REPORT  —  {}", result.exe_name),
+        "PERFORMANCE REPORT",
+        &[result.exe_name.as_str()],
         &format!(
             "{}   |   GPU: {}   |   {}   |   {} сек, {} замеров",
             platform, gpu_name, result.timestamp, result.duration_secs, s.samples
@@ -676,11 +761,16 @@ pub fn generate_comparison_chart(new_res: &TestResult, old_res: &TestResult) -> 
     let (ram_area, table_area) = rest2.split_vertically(250);
 
     let platform = if new_res.platform.is_empty() { "—" } else { new_res.platform.as_str() };
-    let gpu_name = if new_res.gpu_name.is_empty() { "—" } else { new_res.gpu_name.as_str() };
+    let gpu_name = if new_res.gpu_name.is_empty() {
+        "—".to_string()
+    } else {
+        truncate(&new_res.gpu_name, GPU_NAME_MAX)
+    };
 
     draw_header(
         &header,
-        &format!("COMPARISON  —  {}  vs  {}", new_res.exe_name, old_res.exe_name),
+        "COMPARISON",
+        &[new_res.exe_name.as_str(), old_res.exe_name.as_str()],
         &format!(
             "{}   |   GPU: {}   |   {}   |   {} сек",
             platform, gpu_name, new_res.timestamp, new_res.duration_secs
@@ -887,5 +977,73 @@ mod tests {
     fn empty_values_give_zeros() {
         let s = Stat::from(&[]);
         assert_eq!((s.min, s.avg, s.median, s.p95, s.max), (0.0, 0.0, 0.0, 0.0, 0.0));
+    }
+
+    /// Шрифт шапки: тот же кегль и начертание, что в `draw_header`.
+    fn header_font() -> FontDesc<'static> {
+        ("sans-serif", 22).into_font().style(FontStyle::Bold)
+    }
+
+    /// Свободная ширина строки шапки для холста заданной ширины.
+    fn header_avail(canvas_w: i32) -> u32 {
+        (canvas_w - HEADER_PAD * 2) as u32
+    }
+
+    /// Дефект, ради которого писался `header_title`: длинные имена веток
+    /// уезжали за правый край PNG, а `plotters` рисует там молча — ни ошибки,
+    /// ни предупреждения, просто пропадает то, что сравнивали.
+    #[test]
+    fn long_names_stay_inside_canvas() {
+        let font = header_font();
+        let long = "TD-1055-text-rendering-refactor-with-a-very-long-branch-name.exe";
+
+        // Сравнение (холст 1180). Одинаковым именам достаётся одинаковая доля:
+        // обрезка всей строки целиком оставила бы от второго имени огрызок, и
+        // проверка «в строке есть vs» такую починку бы пропустила.
+        let avail = header_avail(1180);
+        let title = header_title("COMPARISON", &[long, long], &font, avail);
+        assert!(text_width(&title, &font) <= avail, "заголовок шире холста: {title}");
+        let (head, tail) = title.split_once(HEADER_VS).expect("в заголовке сравнения нет «vs»");
+        let head_name = head.trim_start_matches("COMPARISON").trim_start_matches(HEADER_DASH);
+        assert_eq!(head_name, tail, "имена ужаты по-разному: {title}");
+        assert!(tail.chars().count() > 10, "от имён остались огрызки: {title}");
+
+        // Одиночный отчёт (холст 1000).
+        let avail = header_avail(1000);
+        let title = header_title("PERFORMANCE REPORT", &[long], &font, avail);
+        assert!(text_width(&title, &font) <= avail, "заголовок шире холста: {title}");
+    }
+
+    /// Обрезка не должна трогать имена нормальной длины: многоточие там, где
+    /// всё влезало, — такая же порча отчёта, только в другую сторону.
+    #[test]
+    fn short_names_are_left_alone() {
+        let font = header_font();
+        assert_eq!(
+            header_title("PERFORMANCE REPORT", &["spectre.exe"], &font, header_avail(1000)),
+            "PERFORMANCE REPORT  —  spectre.exe",
+        );
+        assert_eq!(
+            header_title("COMPARISON", &["new.exe", "old.exe"], &font, header_avail(1180)),
+            "COMPARISON  —  new.exe  vs  old.exe",
+        );
+    }
+
+    /// `fit_to_width` меряет пиксели, а не знаки: строка из узких букв должна
+    /// пережить обрезку длиннее, чем такая же по числу знаков из широких.
+    /// Заодно это проверка, что шрифт вообще нашёлся: не нашёлся — обе строки
+    /// померяются по среднему знаку, окажутся равной длины, и тест упадёт.
+    #[test]
+    fn fit_to_width_counts_pixels_not_chars() {
+        let font = header_font();
+        let narrow = fit_to_width(&"i".repeat(200), &font, 300);
+        let wide = fit_to_width(&"W".repeat(200), &font, 300);
+        assert!(narrow.ends_with('…') && wide.ends_with('…'));
+        assert!(
+            narrow.chars().count() > wide.chars().count(),
+            "узких знаков влезло не больше широких: {} против {}",
+            narrow.chars().count(),
+            wide.chars().count(),
+        );
     }
 }
