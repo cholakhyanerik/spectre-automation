@@ -24,6 +24,13 @@ pub struct TestResult {
     /// Имя обнаруженного GPU-адаптера (для контекста в отчётах).
     #[serde(default)]
     pub gpu_name: String,
+    /// Каким по счёту шёл этот замер внутри одного запуска харнесса: 1 — первым,
+    /// 2 — вторым. Величина не измеренная, а организационная, но без неё числа
+    /// нельзя интерпретировать через месяцы: первая сборка платит за холодный
+    /// кэш ФС, прогрев шейдеров и первичную инициализацию, вторая — нет.
+    /// `0` означает «неизвестно» и стоит в записях, сделанных до появления поля.
+    #[serde(default)]
+    pub run_position: u8,
     pub metrics: Vec<MetricPoint>,
 }
 
@@ -32,6 +39,7 @@ pub async fn start_monitoring(
     duration_secs: u64,
     exe_name: String,
     match_patterns: Vec<String>,
+    run_position: u8,
 ) -> TestResult {
     let mut sys = System::new_all();
     let mut history = Vec::new();
@@ -97,6 +105,7 @@ pub async fn start_monitoring(
         duration_secs,
         platform: crate::config::platform_name().to_string(),
         gpu_name: gpu_monitor.name.clone(),
+        run_position,
         metrics: history,
     }
 }
@@ -220,6 +229,27 @@ mod tests {
     fn empty_pattern_matches_everything() {
         assert!(!name_matches("spectre-terminal.exe", &[]));
         assert!(name_matches("совершенно-посторонний-процесс", &patterns(&[""])));
+    }
+
+    /// Старые `actual.json` обязаны читаться и после появления новых полей:
+    /// `TestResult` — публичный формат, и архив в `reports/history` копится
+    /// месяцами. Пропади `#[serde(default)]` у `run_position` — разбор упал бы
+    /// на КАЖДОЙ записи, сделанной до этой версии.
+    #[test]
+    fn test_result_without_run_position_still_parses() {
+        let json = r#"{
+            "timestamp": "2026-07-09 18:13:49",
+            "exe_name": "future-optimization.exe",
+            "duration_secs": 360,
+            "platform": "Windows",
+            "gpu_name": "Quadro P2200",
+            "metrics": [{ "second": 1, "cpu": 0.5, "ram_mb": 230, "gpu": 7.0 }]
+        }"#;
+
+        let parsed: TestResult =
+            serde_json::from_str(json).expect("старый actual.json перестал читаться");
+        assert_eq!(parsed.run_position, 0, "неизвестная очередь обязана быть нулём, а не выдумкой");
+        assert_eq!(parsed.metrics.len(), 1);
     }
 
     /// Почему дефолтный паттерн — полное имя бинаря, а не префикс семейства

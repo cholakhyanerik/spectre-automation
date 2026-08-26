@@ -4,7 +4,7 @@ mod monitor;
 mod report;
 mod runner;
 
-use config::Config;
+use config::{Config, RunOrder};
 use std::path::Path;
 
 fn check_terminal_state(db_path: &Path) -> bool {
@@ -63,6 +63,63 @@ fn note_short_run(duration_secs: u64, settle_secs: u64) {
     }
 }
 
+/// Какая сборка меряется на этом шаге прогона.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Which {
+    /// Актуальная, `APP_PATH_NEW`. Её провал — единственный, что роняет прогон.
+    New,
+    /// Старая, `APP_PATH_OLD`. Её провал — предупреждение, а не ошибка.
+    Old,
+}
+
+/// Составляет очередь замеров на этот запуск харнесса.
+///
+/// Вынесено в чистую функцию, потому что ошибиться здесь можно молча и дорого.
+/// Выпади отсюда актуальная сборка — прогон завершился бы «успешно», не измерив
+/// ничего; переставься очередь не в ту сторону — числа поменялись бы местами
+/// в пользу другой сборки, и отличить это по отчёту было бы нечем: колонки
+/// в сравнительной таблице задаются не очередью, а `APP_PATH_NEW` / `_OLD`,
+/// и стоят на своих местах при любом порядке замера.
+///
+/// Без старой сборки очередь ни на что не влияет: мерить всё равно нечего,
+/// кроме актуальной, и `RUN_ORDER` в этом случае просто не при чём.
+fn run_sequence(order: RunOrder, has_old: bool) -> Vec<Which> {
+    if !has_old {
+        return vec![Which::New];
+    }
+    match order {
+        RunOrder::NewFirst => vec![Which::New, Which::Old],
+        RunOrder::OldFirst => vec![Which::Old, Which::New],
+    }
+}
+
+/// Говорит вслух, в какой очереди пойдут замеры и чем эта очередь стоит.
+///
+/// Порядок влияет на числа, а из отчёта он не виден ниоткуда, кроме этой
+/// строки и поля `run_position` в JSON: первая сборка платит за холодный кэш
+/// ФС и прогрев, вторая получает их даром.
+fn announce_run_order(order: RunOrder, has_old: bool) {
+    if !has_old {
+        // Сравнивать не с чем. Но если человек ЗАДАЛ порядок и не задал старую
+        // сборку, промолчать нельзя: он ждёт перестановки, а её не будет.
+        if order != config::DEFAULT_RUN_ORDER {
+            println!(
+                "ℹ️  RUN_ORDER={} задан, но APP_PATH_OLD нет — переставлять нечего, меряем только актуальную.",
+                order.as_str()
+            );
+        }
+        return;
+    }
+
+    let (first, second) = match order {
+        RunOrder::NewFirst => ("АКТУАЛЬНАЯ", "СТАРАЯ"),
+        RunOrder::OldFirst => ("СТАРАЯ", "АКТУАЛЬНАЯ"),
+    };
+    println!("🔀 Очередь замера (RUN_ORDER={}): 1) {} → 2) {}.", order.as_str(), first, second);
+    println!("   Первая сборка платит за холодный кэш ФС и прогрев, вторая получает их даром:");
+    println!("   сильнее всего это видно на пике CPU и на первых секундах графика.");
+}
+
 /// Выполняет синхронный шаг прогона так, чтобы он НЕ занимал воркер Tokio.
 ///
 /// Сценарий ввода спит блокирующим `std::thread::sleep` суммарно около 4,5 секунд
@@ -100,6 +157,7 @@ async fn run_single_test(
     app_path: &str,
     duration_secs: u64,
     match_processes: Vec<String>,
+    run_position: u8,
 ) -> Option<monitor::TestResult> {
     let exe_name = extract_filename(app_path);
     println!("\n{} Запуск {} ({})...", step, label, exe_name);
@@ -118,6 +176,7 @@ async fn run_single_test(
         duration_secs,
         exe_name,
         match_processes.clone(),
+        run_position,
     ));
     // Сценарий блокирующий — уводим его с воркера рантайма, иначе замер
     // начинается только после него (см. `run_blocking_step`).
@@ -159,62 +218,101 @@ async fn main() {
     // 3. Проверяем состояние БД
     check_terminal_state(&cfg.db_path);
 
-    // --- ТЕСТИРУЕМ АКТУАЛЬНУЮ ВЕРСИЮ ---
-    let result_new = match run_single_test(
-        "[Шаг 1]",
-        "АКТУАЛЬНОЙ версии",
-        &cfg.app_path_new,
-        cfg.test_duration_secs,
-        cfg.match_processes.clone(),
-    )
-    .await
-    {
-        Some(r) => r,
-        None => {
-            eprintln!("❌ Не удалось протестировать актуальную версию. Завершение работы.");
-            return;
-        }
-    };
-    println!("✅ Тест актуальной версии завершен.");
+    // --- ЗАМЕРЫ В ЗАДАННОЙ ОЧЕРЕДИ ---
+    // Очередь решает `RUN_ORDER`, а не порядок операторов здесь: первая сборка
+    // платит за холодный кэш ФС и прогрев, и это систематическая фора второй.
+    let has_old = cfg.app_path_old.is_some();
+    let sequence = run_sequence(cfg.run_order, has_old);
+    let total = sequence.len();
+    announce_run_order(cfg.run_order, has_old);
 
-    // Сохраняем и выводим отчеты
-    report::print_visual_report(&result_new);
-    report::save_report_json("actual", &result_new);
-    report::save_run_to_history(&result_new);
+    let mut result_new: Option<monitor::TestResult> = None;
+    let mut result_old: Option<monitor::TestResult> = None;
 
-    // --- ПРОВЕРЯЕМ СТАРУЮ ВЕРСИЮ ---
-    let mut compared = false;
-    if let Some(app_path_old) = cfg.app_path_old {
-        if let Some(result_old) = run_single_test(
-            "[Шаг 2] Обнаружена",
-            "СТАРОЙ версии",
-            &app_path_old,
-            cfg.test_duration_secs,
-            cfg.match_processes.clone(),
-        )
-        .await
-        {
-            println!("✅ Тест старой версии завершен.");
+    for (i, which) in sequence.iter().enumerate() {
+        // Позиция замера уезжает в TestResult и дальше в архив: без неё через
+        // месяцы не отличить сборку, мерившуюся на холодной машине, от второй.
+        let position = (i + 1) as u8;
+        let step = format!("[Шаг {}/{}]", position, total);
 
-            report::print_visual_report(&result_old);
-            report::save_report_json("old", &result_old);
-            report::save_run_to_history(&result_old);
+        match which {
+            Which::New => {
+                let Some(result) = run_single_test(
+                    &step,
+                    "АКТУАЛЬНОЙ версии",
+                    &cfg.app_path_new,
+                    cfg.test_duration_secs,
+                    cfg.match_processes.clone(),
+                    position,
+                )
+                .await
+                else {
+                    // Единственный провал, который роняет прогон, — и он роняет
+                    // его в любой очереди, а не только когда идёт первым.
+                    eprintln!("❌ Не удалось протестировать актуальную версию. Завершение работы.");
+                    // При RUN_ORDER=old-first старая сборка к этому моменту уже
+                    // измерена, и запись в истории для неё уже сделана. Уйти
+                    // отсюда молча — значит выбросить готовый замер из-за чужого
+                    // провала и оставить в истории строку без копии в архиве.
+                    if result_old.is_some() {
+                        report::archive_current_run();
+                    }
+                    return;
+                };
+                println!("✅ Тест актуальной версии завершен.");
 
-            // Сравнительные отчеты
-            report::print_comparison_report(&result_new, &result_old);
-            if let Err(e) = report::generate_comparison_chart(&result_new, &result_old) {
-                eprintln!("⚠️  Не удалось построить сравнительный график: {}", e);
+                report::print_visual_report(&result);
+                report::save_report_json("actual", &result);
+                report::save_run_to_history(&result);
+                result_new = Some(result);
             }
-            compared = true;
-        } else {
-            eprintln!("⚠️  Старую версию протестировать не удалось — строим одиночный график актуальной.");
+            Which::Old => {
+                // `run_sequence` ставит сюда шаг только когда путь задан;
+                // проверка оставлена, чтобы рассинхрон не превратился в панику.
+                let Some(app_path_old) = cfg.app_path_old.as_deref() else {
+                    continue;
+                };
+                if let Some(result) = run_single_test(
+                    &step,
+                    "СТАРОЙ версии",
+                    app_path_old,
+                    cfg.test_duration_secs,
+                    cfg.match_processes.clone(),
+                    position,
+                )
+                .await
+                {
+                    println!("✅ Тест старой версии завершен.");
+
+                    report::print_visual_report(&result);
+                    report::save_report_json("old", &result);
+                    report::save_run_to_history(&result);
+                    result_old = Some(result);
+                }
+            }
         }
-    } else {
-        println!("\n[Инфо] Старая версия не указана. Генерируем одиночный график...");
     }
 
+    // --- ОТЧЁТЫ ---
+    if !has_old {
+        println!("\n[Инфо] Старая версия не указана. Генерируем одиночный график...");
+    } else if result_old.is_none() {
+        eprintln!("⚠️  Старую версию протестировать не удалось — строим одиночный график актуальной.");
+    }
+
+    let compared = if let (Some(new), Some(old)) = (&result_new, &result_old) {
+        report::print_comparison_report(new, old);
+        if let Err(e) = report::generate_comparison_chart(new, old) {
+            eprintln!("⚠️  Не удалось построить сравнительный график: {}", e);
+        }
+        true
+    } else {
+        false
+    };
+
     if !compared
-        && let Err(e) = report::generate_single_chart("actual", &result_new)
+        && let Some(new) = &result_new
+        && let Err(e) = report::generate_single_chart("actual", new)
     {
         eprintln!("⚠️  Не удалось построить график: {}", e);
     }
@@ -235,6 +333,38 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    /// Очередь переставляется целиком и в обе стороны. Ошибка здесь не видна
+    /// ниоткуда: в сравнительной таблице колонки задаются `APP_PATH_NEW` /
+    /// `_OLD`, а не очередью, — то есть при перепутанных ветках отчёт выглядел
+    /// бы ровно так же, а фору холодного старта получила бы другая сборка.
+    #[test]
+    fn run_order_swaps_the_whole_sequence() {
+        assert_eq!(run_sequence(RunOrder::NewFirst, true), [Which::New, Which::Old]);
+        assert_eq!(run_sequence(RunOrder::OldFirst, true), [Which::Old, Which::New]);
+    }
+
+    /// Без старой сборки очередь ни на что не влияет, но актуальная обязана
+    /// остаться в любом случае. Выпади она — прогон завершился бы «успешно»,
+    /// не измерив ничего и не сказав ни слова.
+    #[test]
+    fn actual_build_is_measured_in_every_sequence() {
+        for order in [RunOrder::NewFirst, RunOrder::OldFirst] {
+            assert_eq!(run_sequence(order, false), [Which::New], "порядок {order:?} без старой сборки");
+
+            let with_old = run_sequence(order, true);
+            assert_eq!(
+                with_old.iter().filter(|w| **w == Which::New).count(),
+                1,
+                "актуальная сборка мерится не один раз при порядке {order:?}: {with_old:?}"
+            );
+            assert_eq!(
+                with_old.iter().filter(|w| **w == Which::Old).count(),
+                1,
+                "старая сборка мерится не один раз при порядке {order:?}: {with_old:?}"
+            );
+        }
+    }
 
     /// Регрессия на дефект «блокирующий sleep внутри async»: синхронный шаг
     /// прогона не должен занимать воркер рантайма.

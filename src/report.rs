@@ -113,6 +113,12 @@ pub struct RunHistoryRecord {
     pub gpu_name: String,
     #[serde(default)]
     pub samples: usize,
+    /// Каким по счёту шёл замер внутри своего запуска харнесса (1 или 2; 0 —
+    /// неизвестно). Именно этим строка «первая сборка» отличается в архиве от
+    /// строки «вторая»: холодный кэш ФС и прогрев достаются первой, и без
+    /// пометки соседние строки истории выглядят одинаково измеренными.
+    #[serde(default)]
+    pub run_position: u8,
 
     #[serde(default)]
     pub min_cpu: f32,
@@ -157,6 +163,7 @@ fn build_history_record(result: &TestResult) -> RunHistoryRecord {
         platform: result.platform.clone(),
         gpu_name: result.gpu_name.clone(),
         samples: s.samples,
+        run_position: result.run_position,
 
         min_cpu: s.cpu.min as f32,
         avg_cpu: s.cpu.avg as f32,
@@ -273,6 +280,23 @@ fn stat_row(label: &str, s: &Stat, unit: &str, decimals: usize) -> String {
     )
 }
 
+/// Строка об очереди этого замера для шапки одиночного отчёта.
+///
+/// `None` — очередь неизвестна (`run_position == 0`, то есть запись сделана до
+/// появления поля). Придумывать её нельзя: «мерилась первой» — это факт
+/// прогона, а не догадка по имени файла.
+///
+/// Текст обязан укладываться в ширину таблицы: `banner_row` дополняет строку
+/// пробелами, но не обрезает, и слишком длинная разломает рамку — молча и
+/// только на настоящем выводе (Правило 4). На это есть тест.
+fn position_note(run_position: u8) -> Option<&'static str> {
+    match run_position {
+        1 => Some("Очередь замера: ПЕРВЫЙ — холодный кэш ФС и прогрев вошли в эти числа"),
+        2 => Some("Очередь замера: ВТОРОЙ — кэш ФС и часть прогрева достались от первой сборки"),
+        _ => None,
+    }
+}
+
 pub fn print_visual_report(result: &TestResult) {
     if result.metrics.is_empty() {
         return;
@@ -294,6 +318,9 @@ pub fn print_visual_report(result: &TestResult) {
             result.timestamp, result.duration_secs, s.samples
         ))
     );
+    if let Some(note) = position_note(result.run_position) {
+        println!("{}", banner_row(note));
+    }
     println!("{}", rule("├", "┬", "┤"));
     println!(
         "│ {:<m$} │ {:>v$} │ {:>v$} │ {:>v$} │ {:>v$} │ {:>v$} │",
@@ -363,6 +390,29 @@ fn truncate(name: &str, max: usize) -> String {
         let cut: String = name.chars().take(max.saturating_sub(1)).collect();
         format!("{}…", cut)
     }
+}
+
+/// Строка «кто мерился первым» для сравнительного отчёта.
+///
+/// Из самой таблицы очередь не видна ниоткуда: колонки задаются `APP_PATH_NEW`
+/// и `APP_PATH_OLD`, а не порядком замера, и при любой очереди стоят на своих
+/// местах. Между тем первая сборка платит за холодный кэш ФС и прогрев — то
+/// есть часть разницы в таблице объясняется очередью, а не сборками.
+///
+/// `None`, если очередь не восстановить: ноль (запись до появления поля) или
+/// две одинаковые позиции. Догадка здесь была бы хуже молчания — она
+/// объяснила бы разницу тем, чего не было.
+fn order_note(new_name: &str, new_pos: u8, old_name: &str, old_pos: u8, name_max: usize) -> Option<String> {
+    let (first, second) = match (new_pos, old_pos) {
+        (1, 2) => (new_name, old_name),
+        (2, 1) => (old_name, new_name),
+        _ => return None,
+    };
+    Some(format!(
+        "Очередь замера: 1-й — {}, 2-й — {}",
+        truncate(first, name_max),
+        truncate(second, name_max),
+    ))
 }
 
 pub fn print_comparison_report(new_res: &TestResult, old_res: &TestResult) {
@@ -442,6 +492,18 @@ pub fn print_comparison_report(new_res: &TestResult, old_res: &TestResult) {
 
     println!("{}", line("└", "┴", "┘"));
     println!("  Красным — рост потребления, зелёным — снижение.");
+    if let Some(note) = order_note(
+        &new_res.exe_name,
+        new_res.run_position,
+        &old_res.exe_name,
+        old_res.run_position,
+        CV * 2,
+    ) {
+        println!("  {}.", note);
+        println!("  Первый платит за холодный кэш ФС и прогрев, второй получает их даром —");
+        println!("  заметнее всего на пике CPU и на первых секундах. Разница спорная?");
+        println!("  Переставьте RUN_ORDER в .env и повторите: настоящая разница знак сохранит.");
+    }
     println!();
 }
 
@@ -741,6 +803,27 @@ pub fn generate_single_chart(version_name: &str, result: &TestResult) -> ChartRe
     Ok(())
 }
 
+/// Геометрия примечания об очереди замера в сравнительном PNG.
+///
+/// Строка ложится в свободное место справа от заголовка сводной таблицы — то
+/// есть ВНУТРИ рамки (30..1150) и ВЫШЕ первой строки таблицы. Отдельной
+/// строкой в самой таблице она быть не может: там уже шесть строк, а седьмая
+/// (94 + 6·30 = 274) ушла бы под рамку, идущую по 266. Правый предел взят по
+/// разделительной линии заголовков (1136), чтобы примечание кончалось там же,
+/// где кончается таблица.
+const ORDER_NOTE_X: i32 = 360;
+const ORDER_NOTE_Y: i32 = 22;
+const ORDER_NOTE_RIGHT: i32 = 1136;
+const ORDER_NOTE_MAX_W: u32 = (ORDER_NOTE_RIGHT - ORDER_NOTE_X) as u32;
+/// Предел для имени сборки в примечании — тот же, что у колонок таблицы.
+const ORDER_NOTE_NAME_MAX: usize = 22;
+
+/// Шрифт примечания об очереди. Вынесен из функции, чтобы тест мерил ширину
+/// тем же шрифтом, каким строка потом рисуется.
+fn order_note_font() -> FontDesc<'static> {
+    ("sans-serif", 12).into_font()
+}
+
 pub fn generate_comparison_chart(new_res: &TestResult, old_res: &TestResult) -> ChartResult {
     let filename = format!("{}/comparison.png", DIR_CURRENT);
 
@@ -885,6 +968,25 @@ pub fn generate_comparison_chart(new_res: &TestResult, old_res: &TestResult) -> 
     let f_norm = ("sans-serif", 13).into_font();
 
     table_area.draw(&Text::new("COMPARISON SUMMARY", (52, 20), f_title.color(&C_INK)))?;
+
+    // Очередь замера — рядом с заголовком сводной таблицы: часть разницы в ней
+    // объясняется не сборками, а тем, какая из них шла первой (см. order_note).
+    if let Some(note) = order_note(
+        &new_res.exe_name,
+        new_res.run_position,
+        &old_res.exe_name,
+        old_res.run_position,
+        ORDER_NOTE_NAME_MAX,
+    ) {
+        let f_note = order_note_font();
+        let text = format!("{} (первый на холодном старте)", note);
+        let fitted = fit_to_width(&text, &f_note, ORDER_NOTE_MAX_W);
+        table_area.draw(&Text::new(
+            fitted,
+            (ORDER_NOTE_X, ORDER_NOTE_Y),
+            f_note.color(&C_MUTED),
+        ))?;
+    }
 
     let cols = [52, 330, 530, 730, 900, 1030];
     let heads = [
@@ -1078,6 +1180,113 @@ mod tests {
         let bound = ram_upper_bound(&[120.0, 512.0, 300.0]);
         assert!(bound > 512.0, "потолок оси не выше пика: {bound}");
         assert!((bound - 512.0 * 1.18).abs() < 1e-9, "потолок не 18 % над пиком: {bound}");
+    }
+
+    /// Самая дорогая ошибка нового поля в истории: без `#[serde(default)]`
+    /// старые записи перестают разбираться, `save_run_to_history` молча
+    /// заменяет всю историю пустым вектором и дописывает в него одну строку.
+    /// Ни ошибки, ни кода возврата — а `run_history.json` копился месяцами.
+    #[test]
+    fn history_record_without_run_position_still_parses() {
+        let json = r#"[{
+            "date_time": "2026-07-09 18:13:49",
+            "executable": "future-optimization.exe",
+            "duration_secs": 360,
+            "avg_cpu": 11.2, "max_cpu": 42.0,
+            "avg_gpu": 7.0, "max_gpu": 31.0,
+            "avg_ram_mb": 1930.0, "max_ram_mb": 2100
+        }]"#;
+
+        let parsed: Vec<RunHistoryRecord> =
+            serde_json::from_str(json).expect("старый run_history.json перестал читаться");
+        assert_eq!(parsed[0].run_position, 0, "неизвестная очередь обязана быть нулём");
+    }
+
+    /// Очередь обязана доезжать из замера в запись истории. Потеряйся она по
+    /// дороге — в архиве останется ноль, то есть «неизвестно», и соседние
+    /// строки снова станут неразличимы: ни ошибки, ни следа в консоли.
+    #[test]
+    fn history_record_carries_the_run_position() {
+        let result = TestResult {
+            timestamp: "2026-08-27 10:00:00".to_string(),
+            exe_name: "new.exe".to_string(),
+            duration_secs: 30,
+            platform: "Windows".to_string(),
+            gpu_name: "Quadro P2200".to_string(),
+            run_position: 2,
+            metrics: vec![crate::monitor::MetricPoint { second: 1, cpu: 1.0, ram_mb: 100, gpu: 2.0 }],
+        };
+        assert_eq!(build_history_record(&result).run_position, 2);
+    }
+
+    /// Строка об очереди замера стоит в шапке консольного отчёта и обязана
+    /// укладываться в ширину таблицы. `banner_row` дополняет строку пробелами,
+    /// но НЕ обрезает: длинная разломает рамку на один символ, и увидеть это
+    /// можно только глазами на настоящем выводе.
+    #[test]
+    fn position_note_fits_table_width() {
+        for pos in [1u8, 2] {
+            let note = position_note(pos).expect("для позиций 1 и 2 строка обязана быть");
+            let row = banner_row(note);
+            assert_eq!(
+                row.chars().count(),
+                TABLE_W + 2,
+                "строка про очередь не по ширине таблицы ({} знаков): {row}",
+                note.chars().count(),
+            );
+        }
+    }
+
+    /// Неизвестная очередь — это молчание, а не догадка. Ноль стоит в записях,
+    /// сделанных до появления поля; выдумать по ним «мерилось первым» значит
+    /// объяснить разницу тем, чего никто не наблюдал.
+    #[test]
+    fn unknown_position_says_nothing() {
+        assert_eq!(position_note(0), None);
+        assert_eq!(position_note(3), None);
+        assert_eq!(order_note("new.exe", 0, "old.exe", 0, 22), None);
+        assert_eq!(order_note("new.exe", 1, "old.exe", 0, 22), None);
+        // Две одинаковые позиции — рассинхрон, а не очередь.
+        assert_eq!(order_note("new.exe", 1, "old.exe", 1, 22), None);
+    }
+
+    /// Порядок в примечании берётся из позиций, а не из порядка аргументов:
+    /// в отчёт `new_res` приходит первым всегда, при любой очереди замера.
+    /// Перепутай их — примечание уверенно назвало бы первой не ту сборку.
+    #[test]
+    fn order_note_follows_positions_not_arguments() {
+        let note = order_note("new.exe", 1, "old.exe", 2, 22).expect("очередь известна");
+        assert_eq!(note, "Очередь замера: 1-й — new.exe, 2-й — old.exe");
+
+        let swapped = order_note("new.exe", 2, "old.exe", 1, 22).expect("очередь известна");
+        assert_eq!(swapped, "Очередь замера: 1-й — old.exe, 2-й — new.exe");
+    }
+
+    /// Примечание об очереди в сравнительном PNG должно влезать в отведённое
+    /// место целиком: `plotters` рисует за краем молча, а обрезка многоточием
+    /// съест как раз хвост — то самое, ради чего примечание и добавлено.
+    /// Заодно проверяется, что оно не наезжает на заголовок таблицы слева.
+    #[test]
+    fn order_note_fits_beside_summary_title() {
+        let font = order_note_font();
+        // Имена ровно по пределу колонок — так они выглядят в реальном отчёте
+        // после `truncate` (например «TD-1055-text-renderin…»).
+        let long = "TD-1055-text-rendering-refactor.exe";
+        let note = order_note(long, 1, long, 2, ORDER_NOTE_NAME_MAX).expect("очередь известна");
+        let text = format!("{} (первый на холодном старте)", note);
+        assert_eq!(
+            fit_to_width(&text, &font, ORDER_NOTE_MAX_W),
+            text,
+            "примечание об очереди не влезло в {ORDER_NOTE_MAX_W} px и будет обрезано: {text}",
+        );
+
+        // Слева от примечания стоит «COMPARISON SUMMARY» кеглем 15 полужирным.
+        let f_title = ("sans-serif", 15).into_font().style(FontStyle::Bold);
+        let title_end = 52 + text_width("COMPARISON SUMMARY", &f_title) as i32;
+        assert!(
+            title_end < ORDER_NOTE_X,
+            "примечание начинается на {ORDER_NOTE_X}, а заголовок кончается на {title_end}",
+        );
     }
 
     /// Шрифт шапки: тот же кегль и начертание, что в `draw_header`.
