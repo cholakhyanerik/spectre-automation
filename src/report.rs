@@ -55,7 +55,7 @@ impl Stat {
         let mut sorted = values.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        let median = if n % 2 == 0 {
+        let median = if n.is_multiple_of(2) {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
             sorted[n / 2]
@@ -865,4 +865,27 @@ pub fn archive_current_run() {
         }
     }
     println!("📂 Все отчёты текущего запуска скопированы в архив (reports/history/)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Медиана — то, чем в отчётах отвечают на вопрос «сколько потребляет»,
+    /// поэтому обе ветки выбора (чётное / нечётное число замеров) проверяются явно.
+    #[test]
+    fn median_even_and_odd() {
+        // Чётное число значений: среднее двух центральных.
+        assert_eq!(Stat::from(&[1.0, 2.0, 3.0, 4.0]).median, 2.5);
+        // Нечётное: ровно центральное.
+        assert_eq!(Stat::from(&[1.0, 2.0, 3.0]).median, 2.0);
+    }
+
+    /// Пустой набор замеров возможен (прогон не дал ни одной точки) и не должен
+    /// ронять отчёт выходом за границы отсортированного вектора.
+    #[test]
+    fn empty_values_give_zeros() {
+        let s = Stat::from(&[]);
+        assert_eq!((s.min, s.avg, s.median, s.p95, s.max), (0.0, 0.0, 0.0, 0.0, 0.0));
+    }
 }
