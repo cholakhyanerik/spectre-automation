@@ -282,3 +282,53 @@ fn parse_ioreg_utilization(text: &str) -> Option<f32> {
 async fn macos_gpu_usage() -> f32 {
     0.0
 }
+
+/// ВНИМАНИЕ: этот модуль собирается и выполняется ТОЛЬКО на macOS — сама
+/// `parse_ioreg_utilization` живёт под `#[cfg(target_os = "macos")]`. На Windows
+/// и Linux `cargo test` пройдёт зелёным, НЕ выполнив отсюда ни одной проверки.
+/// Зелёный вывод здесь не означает, что ветка macOS проверена; CI в проекте нет,
+/// так что проверить её можно только на самой macOS.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    /// Фрагмент вывода `ioreg -r -d 1 -w 0 -c IOAccelerator -k
+    /// PerformanceStatistics`: словарь в одну строку, значения через запятую.
+    const IOREG: &str = concat!(
+        "  | {\n",
+        "  |   \"PerformanceStatistics\" = {\"Alloc system memory\"=123456,",
+        "\"Device Utilization %\"=37,\"Renderer Utilization %\"=12,",
+        "\"In use system memory\"=654321}\n",
+        "  | }\n",
+    );
+
+    /// Значение берётся из середины словаря и обрывается на запятой, а не
+    /// заглатывает соседний ключ.
+    #[test]
+    fn reads_utilization_from_ioreg_dump() {
+        assert_eq!(parse_ioreg_utilization(IOREG), Some(37.0));
+    }
+
+    /// Дробная часть не должна теряться: округление до целого здесь никем
+    /// не заказано, а на слабой нагрузке съедало бы всю разницу между сборками.
+    #[test]
+    fn keeps_fractional_value() {
+        assert_eq!(parse_ioreg_utilization("\"Device Utilization %\"=37.5,"), Some(37.5));
+    }
+
+    /// Ключа нет — это ОТКАЗ измерения, и на этом уровне он обязан быть
+    /// отличим от честного нуля. В `0.0` его превращает вызывающая
+    /// `macos_gpu_usage` — сознательно и в одном месте (Правило 6).
+    #[test]
+    fn missing_key_is_none_not_zero() {
+        assert_eq!(parse_ioreg_utilization("{\"Renderer Utilization %\"=12}"), None);
+        assert_eq!(parse_ioreg_utilization(""), None);
+    }
+
+    /// Ключ есть, а числа за ним нет (обрезанный или изменившийся вывод) —
+    /// тоже отказ, а не ноль.
+    #[test]
+    fn key_without_number_is_none() {
+        assert_eq!(parse_ioreg_utilization("\"Device Utilization %\"=,\"Free memory\"=1"), None);
+    }
+}

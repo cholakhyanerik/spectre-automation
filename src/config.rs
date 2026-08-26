@@ -130,3 +130,51 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("exchanges.db")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Паттерн выводится из полного имени бинаря без расширения и приводится
+    /// к нижнему регистру: сопоставление в мониторе регистрозависимо
+    /// (`monitor::name_matches`). Пути с прямым слэшем разбираются одинаково
+    /// на всех трёх ОС, поэтому проверка общая.
+    #[test]
+    fn pattern_is_lowercased_file_stem() {
+        assert_eq!(default_match_patterns("/opt/spectre/spectre-terminal"), ["spectre-terminal"]);
+        assert_eq!(default_match_patterns("/opt/builds/Spectre-Terminal.exe"), ["spectre-terminal"]);
+    }
+
+    /// Windows-путь с обратными слэшами — основной случай для этого проекта,
+    /// но разбирается он так только на Windows: на Linux и macOS обратный слэш
+    /// не разделитель, и весь путь стал бы одним именем файла.
+    #[cfg(windows)]
+    #[test]
+    fn pattern_from_windows_path() {
+        assert_eq!(
+            default_match_patterns(r"C:\Builds\TD-1055\Spectre-Terminal.exe"),
+            ["spectre-terminal"],
+        );
+    }
+
+    /// Точки в имени сборки принадлежат имени, а не расширению: `file_stem`
+    /// отрезает только последнее. Укоротись паттерн до «dev-latest» — под него
+    /// попали бы соседние сборки того же семейства, и в конце прогона их убили бы.
+    #[test]
+    fn dots_in_name_stay_in_pattern() {
+        assert_eq!(default_match_patterns("/opt/dev-latest.2026.01.exe"), ["dev-latest.2026.01"]);
+        assert_eq!(default_match_patterns("/opt/build.v2/spectre-terminal"), ["spectre-terminal"]);
+    }
+
+    /// Самый дорогой случай: путь, из которого имени не выводится. Вернуть
+    /// отсюда пустую строку нельзя ни при каких обстоятельствах — по этим
+    /// паттернам процессы не только считаются, но и УБИВАЮТСЯ, а `contains("")`
+    /// истинно для любого имени в системе.
+    #[test]
+    fn unusable_path_gives_no_patterns() {
+        for path in ["", "/", "..", "."] {
+            let got = default_match_patterns(path);
+            assert!(got.is_empty(), "путь {path:?} дал паттерны {got:?}");
+        }
+    }
+}

@@ -178,3 +178,55 @@ pub fn terminate_app(main_pid: u32, patterns: &[String]) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn patterns(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Сопоставление идёт по ВХОЖДЕНИЮ подстроки, и на этом держится учёт
+    /// мультиоконного режима: «spectre-terminal.exe (2)» — то же приложение.
+    /// Перестань оно ловиться — потребление дополнительных окон молча выпадет
+    /// из замера, и сборка покажется легче, чем она есть.
+    #[test]
+    fn name_matches_by_substring() {
+        let p = patterns(&["spectre-terminal"]);
+        assert!(name_matches("spectre-terminal.exe", &p));
+        assert!(name_matches("spectre-terminal.exe (2)", &p));
+        assert!(!name_matches("notepad.exe", &p));
+    }
+
+    /// Сопоставление РЕГИСТРОЗАВИСИМО, и это контракт с вызывающими: имя
+    /// процесса к нижнему регистру приводят `collect_app_metrics` и
+    /// `terminate_app`, паттерны — `Config::load`. Уберут приведение с любой
+    /// стороны — совпадений не будет вовсе, а выглядеть это будет как
+    /// «приложение ничего не потребляло».
+    #[test]
+    fn name_matches_relies_on_caller_lowercasing() {
+        let p = patterns(&["spectre-terminal"]);
+        assert!(!name_matches("Spectre-Terminal.exe", &p));
+        assert!(name_matches(&"Spectre-Terminal.exe".to_lowercase(), &p));
+    }
+
+    /// Пустой СПИСОК паттернов не совпадает ни с чем, а вот пустая СТРОКА
+    /// в списке совпадает со всем: `contains("")` истинно для любого имени.
+    /// По этим же паттернам процессы в конце прогона убиваются, так что один
+    /// пустой паттерн — это «выкосить всё, до чего дотянемся». Отсеивается он
+    /// в конфиге (`default_match_patterns` и разбор MATCH_PROCESSES), а не здесь.
+    #[test]
+    fn empty_pattern_matches_everything() {
+        assert!(!name_matches("spectre-terminal.exe", &[]));
+        assert!(name_matches("совершенно-посторонний-процесс", &patterns(&[""])));
+    }
+
+    /// Почему дефолтный паттерн — полное имя бинаря, а не префикс семейства
+    /// (доккомментарий `config::default_match_patterns`): короткая подстрока
+    /// ловит чужие процессы, и они не просто попадут в метрики — их убьют.
+    #[test]
+    fn short_prefix_catches_strangers() {
+        assert!(name_matches("devenv.exe", &patterns(&["dev"])));
+    }
+}
