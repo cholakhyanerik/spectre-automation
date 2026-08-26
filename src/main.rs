@@ -29,6 +29,30 @@ fn extract_filename(path: &str) -> String {
         .unwrap_or_else(|| "unknown.exe".to_string())
 }
 
+/// Выполняет синхронный шаг прогона так, чтобы он НЕ занимал воркер Tokio.
+///
+/// Сценарий ввода спит блокирующим `std::thread::sleep` суммарно около 4,5 секунд
+/// и переписать его на `tokio::time::sleep` нельзя: `enigo` синхронный. Прямой
+/// вызов из async-функции занимал бы воркер рантайма целиком, и сходило бы это
+/// с рук только по везению — потому что `#[tokio::main]` по умолчанию даёт
+/// многопоточный рантайм и задача мониторинга уезжает на другой воркер. Переход
+/// на `flavor = "current_thread"` (одна строка, выглядящая упрощением) превратил
+/// бы это в 4,5 секунды без единого замера в начале КАЖДОГО прогона: ни ошибки
+/// сборки, ни подсказки clippy, ни падения — график просто начался бы с пятой
+/// секунды, а разгон приложения, самое интересное место замера, не попал бы в
+/// отчёт вовсе. `spawn_blocking` уводит шаг в отдельный пул потоков и снимает
+/// зависимость замера от устройства рантайма.
+///
+/// Паника внутри шага не роняет прогон: сценарий важен, но замер важнее.
+async fn run_blocking_step<F>(name: &str, step: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if let Err(e) = tokio::task::spawn_blocking(step).await {
+        eprintln!("⚠️  {} не отработал ({}). Замер продолжается.", name, e);
+    }
+}
+
 /// Запускает приложение, снимает метрики за `duration_secs`, затем гарантированно
 /// завершает и «пожинает» (`wait`) процесс со всем деревом окон/модалок.
 ///
@@ -61,7 +85,9 @@ async fn run_single_test(
         exe_name,
         match_processes.clone(),
     ));
-    runner::execute_ui_scenario();
+    // Сценарий блокирующий — уводим его с воркера рантайма, иначе замер
+    // начинается только после него (см. `run_blocking_step`).
+    run_blocking_step("Сценарий UI", runner::execute_ui_scenario).await;
 
     let result = match monitor_handle.await {
         Ok(r) => Some(r),
@@ -164,4 +190,50 @@ async fn main() {
 
     println!("\n🎉 Тестирование успешно завершено! Отчеты сохранены в 'reports/'");
     println!("====================================================");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Регрессия на дефект «блокирующий sleep внутри async»: синхронный шаг
+    /// прогона не должен занимать воркер рантайма.
+    ///
+    /// Проверяется на ОДНОПОТОЧНОМ рантайме намеренно: на многопоточном (каким
+    /// его делает `#[tokio::main]` по умолчанию) прямой вызов проходит незаметно —
+    /// фоновая задача просто уезжает на свободный воркер, и тест был бы зелёным
+    /// при сломанном коде. Здесь воркер один, и если шаг выполняется прямо
+    /// в async-контексте, фоновая задача — в бою это мониторинг — не получает
+    /// ни одного опроса, пока шаг спит.
+    #[test]
+    fn blocking_step_lets_background_task_run() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("не удалось собрать однопоточный рантайм");
+
+        let ticked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ticked);
+
+        rt.block_on(async move {
+            let background = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                flag.store(true, Ordering::SeqCst);
+            });
+
+            run_blocking_step("тестовый шаг", || {
+                std::thread::sleep(Duration::from_millis(500))
+            })
+            .await;
+
+            assert!(
+                ticked.load(Ordering::SeqCst),
+                "фоновая задача не отработала за 500 мс: синхронный шаг занял воркер рантайма"
+            );
+            background.await.expect("фоновая задача не должна падать");
+        });
+    }
 }
