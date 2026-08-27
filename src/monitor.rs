@@ -166,26 +166,183 @@ fn collect_app_metrics(sys: &System, main_pid: Pid, patterns: &[String]) -> (f32
     (total_cpu, total_ram)
 }
 
+/// Сколько раз перепроверять, что процессы приложения действительно исчезли,
+/// и сколько ждать перед каждой проверкой.
+///
+/// Пауза обязательна: между отправкой сигнала и исчезновением процесса из
+/// списка проходит время, и проверка без паузы дала бы ложную тревогу на
+/// каждом прогоне. Стоит она здесь дёшево — замер уже кончился, мерить нечего
+/// (Правило 1 запрещает тратить машину ВО ВРЕМЯ замера, а не после него).
+/// В обычном прогоне хватает первой проверки; полторы секунды набегают только
+/// когда что-то и правда не умирает, то есть ровно тогда, когда есть о чём
+/// говорить вслух.
+const TERMINATE_CHECKS: usize = 5;
+const TERMINATE_PAUSE: Duration = Duration::from_millis(300);
+
+/// Процесс, намеченный к завершению: PID и имя в нижнем регистре.
+///
+/// Имя хранится не ради вывода. При перепроверке по нему отличают выжившее
+/// окно приложения от постороннего процесса, которому ОС успела отдать
+/// освободившийся PID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Target {
+    pid: Pid,
+    name: String,
+}
+
+/// Снимает с живого `System` пары «PID, имя в нижнем регистре».
+///
+/// Нужен, чтобы выбор целей (`select_targets`) не зависел от `&System` и
+/// проверялся тестами: ошибиться там можно молча и в обе стороны — не убить
+/// выжившего или убить постороннего.
+fn name_snapshot(sys: &System) -> Vec<(Pid, String)> {
+    sys.processes()
+        .iter()
+        .map(|(pid, process)| (*pid, process.name().to_string_lossy().to_lowercase()))
+        .collect()
+}
+
+/// Кто из снимка процессов относится к приложению и подлежит завершению.
+///
+/// `known` — цели предыдущего прохода, и нужен он только при ПЕРЕПРОВЕРКЕ, зато
+/// там незаменим. К этому моменту главный процесс уже мёртв, дерево потомков
+/// пересчитать не по чему, и остаётся одно сопоставление имён — то есть
+/// вспомогательное окно, чьё имя с паттернами не совпадает, перестало бы
+/// считаться процессом приложения и не попало бы ни в добивание, ни в
+/// предупреждение. Ровно тот молчаливый отказ, ради которого всё и затевалось.
+///
+/// Совпадение по `known` требует И PID, И имени: PID освобождается сразу и
+/// достаётся первому попавшемуся новому процессу. Обвинить посторонний процесс
+/// в том, что он «пережил завершение», — ложная тревога того же сорта, что и
+/// молчание о настоящем выжившем, и обесценивает предупреждение так же быстро.
+fn select_targets(
+    snapshot: &[(Pid, String)],
+    subtree: &HashSet<Pid>,
+    patterns: &[String],
+    self_pid: Pid,
+    known: &[Target],
+) -> Vec<Target> {
+    snapshot
+        .iter()
+        // Критично: НЕ убиваем сам процесс теста (его имя тоже совпадает
+        // с паттерном). Проверка стоит первой и без неё харнесс на некоторых
+        // наборах MATCH_PROCESSES прибьёт себя на первом же прогоне.
+        .filter(|(pid, _)| *pid != self_pid)
+        .filter(|(pid, name)| {
+            subtree.contains(pid)
+                || name_matches(name, patterns)
+                || known.iter().any(|t| t.pid == *pid && &t.name == name)
+        })
+        .map(|(pid, name)| Target { pid: *pid, name: name.clone() })
+        .collect()
+}
+
+/// Шлёт сигнал завершения каждой цели и запоминает тех, кому его не удалось
+/// даже отправить.
+///
+/// `kill()` отвечает на вопрос «сигнал отправлен?», а не «процесс умер?» — это
+/// написано прямо в его доккомментарии в `sysinfo`. Поэтому здесь копится
+/// только ПОДСКАЗКА к будущему предупреждению (отказ — обычно нет прав или
+/// процесс системный), а вывод о результате делается по факту: по тому, кто
+/// остался в системе.
+fn kill_targets(sys: &System, targets: &[Target], refused: &mut HashSet<Pid>) {
+    for target in targets {
+        let Some(process) = sys.process(target.pid) else {
+            continue;
+        };
+        // Помним ИСХОД ПОСЛЕДНЕЙ попытки: отказ на первом проходе и успех на
+        // втором — это не «нет прав», и подсказка не должна утверждать обратное.
+        if process.kill() {
+            refused.remove(&target.pid);
+        } else {
+            refused.insert(target.pid);
+        }
+    }
+}
+
+/// Говорит вслух о процессах приложения, переживших завершение.
+///
+/// Молчать здесь нельзя: осиротевшее окно доживёт до следующего прогона и
+/// попадёт в ЕГО метрики через совпадение имени — потребление одной сборки
+/// прибавится к числам другой. В отчёте это выглядит обычной регрессией:
+/// красный цвет, проценты, вердикт «хуже», — и отличить её там нечем.
+fn warn_survivors(survivors: &[Target], refused: &HashSet<Pid>) {
+    eprintln!(
+        "⚠️  Завершить приложение удалось не полностью: в системе осталось процессов — {}.",
+        survivors.len()
+    );
+    for target in survivors {
+        let why = if refused.contains(&target.pid) {
+            "сигнал завершения отклонён — нет прав или процесс системный"
+        } else {
+            "сигнал принят, но процесс не исчез"
+        };
+        eprintln!("    • PID {} — {} ({})", target.pid, target.name, why);
+    }
+    eprintln!("    Они доживут до следующего прогона и попадут в ЕГО метрики через");
+    eprintln!("    совпадение имени: потребление этой сборки прибавится к чужой, и");
+    eprintln!("    в отчёте это будет выглядеть обычной регрессией. Закройте их");
+    eprintln!("    вручную (диспетчер задач, Get-Process, ps) перед следующим замером.");
+}
+
 /// Завершает все процессы приложения (главный, доп. окна и модалки-приложения),
 /// чтобы осиротевшие окна не перетекали в следующий прогон и не искажали замер.
+///
+/// Это не одиночный выстрел, а цикл с проверкой ФАКТА. `kill()` возвращает
+/// `bool`, и раньше он отбрасывался целиком — а значит, выживший процесс не
+/// оставлял ни одного следа: прогон заканчивался успехом, и его потребление
+/// всплывало в следующем замере под именем чужой сборки. Проверять при этом
+/// надо не код возврата (он говорит лишь об отправке сигнала), а то, кто
+/// остался в системе, — это Правило 6.
+///
+/// Готового `kill_and_wait()` в `sysinfo` мы не берём намеренно: его
+/// доккомментарий обещает БЕСКОНЕЧНЫЙ ЦИКЛ на процессе, который не убивается.
+/// Подвесить харнесс насмерть после трёхминутного замера — хуже, чем выжившее
+/// окно, о котором сказано вслух.
 pub fn terminate_app(main_pid: u32, patterns: &[String]) {
     let mut sys = System::new_all();
     sys.refresh_all();
 
     let main_pid = Pid::from(main_pid as usize);
-    let subtree = collect_subtree(&sys, main_pid);
-    // Критично: НЕ убиваем сам процесс теста (его имя тоже совпадает с паттерном).
     let self_pid = Pid::from(std::process::id() as usize);
 
-    for (pid, process) in sys.processes() {
-        if *pid == self_pid {
-            continue;
+    // Дерево потомков считается ОДИН раз, на первом проходе, и дальше живёт
+    // в списке целей. Пересчитывать его на каждой проверке нельзя: главный
+    // процесс к этому моменту уже мёртв (`kill` + `wait` сделаны вызывающей
+    // стороной), его PID свободен, и достаться он может постороннему — тогда
+    // «дерево потомков» указало бы на чужие процессы, и мы убили бы их.
+    let subtree = collect_subtree(&sys, main_pid);
+    let no_subtree = HashSet::new();
+
+    let mut targets = select_targets(&name_snapshot(&sys), &subtree, patterns, self_pid, &[]);
+    let mut refused: HashSet<Pid> = HashSet::new();
+    kill_targets(&sys, &targets, &mut refused);
+
+    for check in 1..=TERMINATE_CHECKS {
+        std::thread::sleep(TERMINATE_PAUSE);
+        // `refresh_all` выкидывает из списка мёртвые процессы — именно поэтому
+        // «остался в списке» здесь означает «жив», а не «когда-то был».
+        sys.refresh_all();
+
+        targets = select_targets(
+            &name_snapshot(&sys),
+            &no_subtree,
+            patterns,
+            self_pid,
+            &targets,
+        );
+        if targets.is_empty() {
+            return;
         }
-        let name_lc = process.name().to_string_lossy().to_lowercase();
-        if subtree.contains(pid) || name_matches(&name_lc, patterns) {
-            process.kill();
+        // На последней проверке бить уже поздно: перепроверить результат нечем,
+        // и предупреждение говорило бы о процессах, которым не дали ни секунды
+        // на смерть, — то есть врало бы ровно так же, как молчание.
+        if check < TERMINATE_CHECKS {
+            kill_targets(&sys, &targets, &mut refused);
         }
     }
+
+    warn_survivors(&targets, &refused);
 }
 
 #[cfg(test)]
@@ -258,5 +415,103 @@ mod tests {
     #[test]
     fn short_prefix_catches_strangers() {
         assert!(name_matches("devenv.exe", &patterns(&["dev"])));
+    }
+
+    fn snapshot(items: &[(usize, &str)]) -> Vec<(Pid, String)> {
+        items.iter().map(|(pid, name)| (Pid::from(*pid), name.to_string())).collect()
+    }
+
+    fn tree(pids: &[usize]) -> HashSet<Pid> {
+        pids.iter().map(|pid| Pid::from(*pid)).collect()
+    }
+
+    fn pids_of(targets: &[Target]) -> Vec<usize> {
+        targets.iter().map(|t| usize::from(t.pid)).collect()
+    }
+
+    /// Самая дорогая ошибка этого файла: харнесс убивает сам себя посреди
+    /// прогона. Проверяется худший случай — собственный процесс и по имени
+    /// совпал (`MATCH_PROCESSES` задаёт человек, одной подстроки хватит),
+    /// и в дерево потомков попал, и числится среди целей прошлого прохода.
+    /// Ни один из трёх путей не должен его пропустить.
+    #[test]
+    fn own_process_is_never_targeted() {
+        let self_pid = Pid::from(100);
+        let known = vec![Target { pid: self_pid, name: "spectre-automation.exe".to_string() }];
+        let snap = snapshot(&[(100, "spectre-automation.exe"), (200, "spectre-terminal.exe")]);
+
+        let targets =
+            select_targets(&snap, &tree(&[100, 200]), &patterns(&["spectre"]), self_pid, &known);
+
+        assert_eq!(pids_of(&targets), vec![200], "харнесс попал в список на убийство");
+    }
+
+    /// Ради чего у выбора целей вообще появился параметр `known`.
+    ///
+    /// На перепроверке главного процесса уже нет, дерево потомков пересчитать
+    /// не по чему, и вспомогательный процесс приложения, чьё имя с паттернами
+    /// не совпадает, опознаётся ТОЛЬКО по списку прошлого прохода. Потеряйся
+    /// он — выживший не попал бы ни в добивание, ни в предупреждение, и его
+    /// потребление уехало бы в следующий замер под чужим именем.
+    #[test]
+    fn recheck_keeps_orphan_outside_the_name_patterns() {
+        let self_pid = Pid::from(1);
+        let p = patterns(&["spectre-terminal"]);
+
+        let first = snapshot(&[(200, "spectre-terminal.exe"), (300, "crashpad_handler.exe")]);
+        let targets = select_targets(&first, &tree(&[200, 300]), &p, self_pid, &[]);
+        assert_eq!(pids_of(&targets), vec![200, 300], "первый проход потерял потомка");
+
+        let second = snapshot(&[(300, "crashpad_handler.exe")]);
+        let survivors = select_targets(&second, &HashSet::new(), &p, self_pid, &targets);
+        assert_eq!(
+            pids_of(&survivors),
+            vec![300],
+            "выживший вне паттернов имён потерялся при перепроверке"
+        );
+    }
+
+    /// Обратная ошибка, такая же молчаливая: PID освобождается сразу, и ОС
+    /// отдаёт его первому попавшемуся процессу. Объявить того выжившим — значит
+    /// и убить постороннего, и напечатать предупреждение на ровном месте;
+    /// предупреждение, которое врёт, перестают читать первым.
+    #[test]
+    fn recycled_pid_is_not_mistaken_for_a_survivor() {
+        let self_pid = Pid::from(1);
+        let known = vec![Target { pid: Pid::from(300), name: "crashpad_handler.exe".to_string() }];
+        let snap = snapshot(&[(300, "notepad.exe")]);
+
+        let survivors = select_targets(
+            &snap,
+            &HashSet::new(),
+            &patterns(&["spectre-terminal"]),
+            self_pid,
+            &known,
+        );
+
+        assert!(
+            survivors.is_empty(),
+            "чужой процесс с переиспользованным PID объявлен выжившим: {survivors:?}"
+        );
+    }
+
+    /// Окно, открывшееся уже после первого прохода (приложение доспавнивает их
+    /// и в момент завершения), обязано попасть в добивание по имени: иначе
+    /// осиротеет именно оно.
+    #[test]
+    fn window_opened_after_the_first_pass_is_still_targeted() {
+        let self_pid = Pid::from(1);
+        let known = vec![Target { pid: Pid::from(200), name: "spectre-terminal.exe".to_string() }];
+        let snap = snapshot(&[(400, "spectre-terminal.exe (2)")]);
+
+        let late = select_targets(
+            &snap,
+            &HashSet::new(),
+            &patterns(&["spectre-terminal"]),
+            self_pid,
+            &known,
+        );
+
+        assert_eq!(pids_of(&late), vec![400], "позднее окно не попало в добивание");
     }
 }
