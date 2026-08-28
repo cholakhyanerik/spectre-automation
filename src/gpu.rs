@@ -9,8 +9,15 @@ enum GpuBackend {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     LinuxSysfs(PathBuf),
     /// Windows: счётчик производительности "\GPU Engine(*)\Utilization Percentage"
-    /// (покрывает AMD и Intel, для которых нет простого API).
-    WindowsCounter,
+    /// (покрывает AMD и Intel, для которых нет простого API). Несёт в себе открытый
+    /// ОДИН РАЗ запрос PDH — так же, как `LinuxSysfs` несёт свой путь: в цикле замера
+    /// остаётся пара вызовов библиотеки вместо запуска powershell.exe на каждую секунду.
+    ///
+    /// Хэндлы хранятся как `isize`, а не как указатели, и это не косметика:
+    /// `GpuMonitor` живёт внутри задачи, отданной `tokio::spawn` (monitor.rs), то есть
+    /// обязан оставаться `Send`. Сырой указатель отнял бы это молча — ошибкой сборки
+    /// в чужом файле, а не здесь.
+    WindowsCounter { query: isize, counter: isize },
     /// macOS / Apple Silicon: утилизация интегрированного GPU через ioreg
     /// (ключ "Device Utilization %" в PerformanceStatistics, без прав root).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -59,10 +66,27 @@ impl GpuMonitor {
         #[cfg(target_os = "windows")]
         {
             let name = windows_gpu_name().unwrap_or_else(|| "GPU (Windows)".to_string());
+            if let Some((query, counter)) = windows_gpu_open() {
+                return Self {
+                    nvml,
+                    backend: GpuBackend::WindowsCounter { query, counter },
+                    name,
+                };
+            }
+
+            // Счётчик не открылся — значит метрики GPU не будет ВЕСЬ прогон.
+            // Сказать об этом вслух обязательно: ровная линия по нулю в отчёте
+            // выглядит как «видеокарта не нагружалась», а не как отказ измерения
+            // (Правило 6). Молча оставить бэкенд выбранным — худший вариант.
+            eprintln!(
+                "⚠️  Счётчик загрузки GPU недоступен: PDH не отдал \
+                 \\GPU Engine(*)\\Utilization Percentage. Метрика GPU будет нулевой \
+                 весь прогон — сравнивать по ней сборки нельзя."
+            );
             return Self {
                 nvml,
-                backend: GpuBackend::WindowsCounter,
-                name,
+                backend: GpuBackend::Unavailable,
+                name: format!("{} (счётчик недоступен)", name),
             };
         }
 
@@ -106,11 +130,26 @@ impl GpuMonitor {
                     .clamp(0.0, 100.0)
             }
 
-            GpuBackend::WindowsCounter => windows_gpu_usage().await,
+            // Синхронный вызов внутри async — намеренно, как и чтение sysfs выше:
+            // это пара обращений к уже открытому запросу PDH, около миллисекунды.
+            // Раньше здесь стоял `.await` на запуске powershell.exe, и стоил он
+            // 3,2 секунды при шаге семплинга в секунду (замерено 28.08.2026).
+            GpuBackend::WindowsCounter { query, counter } => windows_gpu_usage(*query, *counter),
 
             GpuBackend::MacOsIoreg => macos_gpu_usage().await,
 
             GpuBackend::Unavailable => 0.0,
+        }
+    }
+}
+
+/// Закрываем запрос PDH за собой. На прогоне-сравнении мониторов создаётся два,
+/// и каждый держит запрос с сотнями экземпляров счётчика (на этой машине — 506).
+#[cfg(target_os = "windows")]
+impl Drop for GpuMonitor {
+    fn drop(&mut self) {
+        if let GpuBackend::WindowsCounter { query, .. } = &self.backend {
+            unsafe { PdhCloseQuery(*query) };
         }
     }
 }
@@ -172,60 +211,213 @@ fn windows_gpu_name() -> Option<String> {
     }
 }
 
-/// Windows: загрузка GPU через счётчик производительности.
+// PDH (Performance Data Helper) — системная библиотека Windows, та самая, через
+// которую работает и `Get-Counter`. Пять объявлений мы пишем сами: обёрточный
+// крейт ради пяти строк — лишняя зависимость (раздел «Общее» в CLAUDE.md), а
+// `raw-dylib` снимает и требование Windows SDK — импорт строится по имени DLL,
+// линковщику не нужен `pdh.lib`.
+//
+// Хэндлы объявлены как `isize`, а не `*mut c_void`: для непрозрачного значения
+// размером с указатель это тот же ABI, зато `GpuBackend` остаётся `Send`.
+#[cfg(target_os = "windows")]
+#[link(name = "pdh.dll", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn PdhOpenQueryW(data_source: *const u16, user_data: usize, query: *mut isize) -> u32;
+    fn PdhAddEnglishCounterW(
+        query: isize,
+        path: *const u16,
+        user_data: usize,
+        counter: *mut isize,
+    ) -> u32;
+    fn PdhCollectQueryData(query: isize) -> u32;
+    fn PdhGetFormattedCounterArrayW(
+        counter: isize,
+        format: u32,
+        buffer_size: *mut u32,
+        item_count: *mut u32,
+        buffer: *mut PdhCounterItem,
+    ) -> u32;
+    fn PdhCloseQuery(query: isize) -> u32;
+}
+
+/// Просим у PDH значения типа `double`.
+#[cfg(target_os = "windows")]
+const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
+/// «Буфера не хватило, вот нужный размер» — штатный первый ответ, а не ошибка.
+#[cfg(target_os = "windows")]
+const PDH_MORE_DATA: u32 = 0x8000_07D2;
+/// Значение экземпляра снято корректно.
+#[cfg(target_os = "windows")]
+const PDH_CSTATUS_VALID_DATA: u32 = 0x0000_0000;
+/// То же самое, но значение обновилось с прошлого сбора. Тоже ВАЛИДНОЕ: пропустить
+/// его — значит недосчитать как раз те движки, которые сейчас и работают.
+#[cfg(target_os = "windows")]
+const PDH_CSTATUS_NEW_DATA: u32 = 0x0000_0001;
+
+/// Элемент массива, который отдаёт `PdhGetFormattedCounterArrayW`
+/// (`PDH_FMT_COUNTERVALUE_ITEM_W`). На x86-64 занимает 24 байта: указатель на имя
+/// экземпляра (8), код состояния (4), выравнивание (4), само значение (8).
+/// Раскладка сверена с замером: шаг между элементами реального буфера — 24 байта.
+///
+/// Имя экземпляра нам не нужно (мы берём максимум по всем), но выкинуть поле
+/// нельзя — от него зависит смещение остальных.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct PdhCounterItem {
+    name: *mut u16,
+    status: u32,
+    value: f64,
+}
+
+/// Открывает запрос PDH к счётчику загрузки GPU и делает первый, базовый сбор.
+///
+/// `None` означает «счётчика нет» — например, на системе, где счётчики
+/// производительности отключены или повреждены (`unlodctr`). Это НЕ то же самое,
+/// что «GPU не нагружен»: вызывающая сторона обязана развести эти случаи, иначе
+/// получится ровная нулевая линия, неотличимая от измеренной (Правило 6).
+#[cfg(target_os = "windows")]
+fn windows_gpu_open() -> Option<(isize, isize)> {
+    let mut query: isize = 0;
+    if unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut query) } != PDH_CSTATUS_VALID_DATA {
+        return None;
+    }
+
+    // Путь берётся АНГЛИЙСКИЙ, и это не недосмотр: `PdhAddEnglishCounterW` сам
+    // переводит его в имена текущего языка системы. Имена счётчиков локализованы,
+    // и раньше эту работу делал скрипт, лазивший в реестр Perflib, — без него
+    // Get-Counter не находил путь на русской Windows и метрика молча уходила
+    // в ноль (Правило 6). Теперь перевод делает сама библиотека, то есть целого
+    // класса отказов «путь зашит по-английски» здесь больше нет.
+    //
+    // Звёздочка обязана остаться звёздочкой: набор движков GPU меняется на ходу
+    // (запустилось приложение, подключили внешнюю карту). Проверено 28.08.2026 на
+    // этой машине — при запуске нового окна экземпляров стало 544 вместо 520, и
+    // однажды открытый запрос увидел новые сам. Зафиксировать конкретный
+    // экземпляр — значит перестать видеть как раз то, что меряем.
+    let path: Vec<u16> = "\\GPU Engine(*)\\Utilization Percentage"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut counter: isize = 0;
+    if unsafe { PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) }
+        != PDH_CSTATUS_VALID_DATA
+    {
+        unsafe { PdhCloseQuery(query) };
+        return None;
+    }
+
+    // Счётчик скоростной: первый сбор только ставит базу, значения появляются
+    // со второго (проверено — первый отдаёт PDH_CSTATUS_INVALID_DATA). Делаем
+    // базовый сбор здесь, до начала цикла, чтобы ПЕРВАЯ точка графика была
+    // измеренной. Иначе разгон приложения — самое интересное место прогона —
+    // начинался бы с нуля-заглушки.
+    unsafe { PdhCollectQueryData(query) };
+
+    Some((query, counter))
+}
+
+/// Windows: загрузка GPU через счётчик производительности, снятый напрямую из PDH.
+///
 /// Берём МАКСИМУМ по всем движкам, а не сумму: суммирование 3D+Copy+Video+Compute
 /// сильно завышает значение и легко уходит за 100%. Максимум одного движка —
 /// корректный показатель утилизации видеокарты.
 ///
-/// Имена счётчиков производительности ЛОКАЛИЗОВАНЫ: на русской Windows путь
-/// "\GPU Engine(*)\Utilization Percentage" не существует и Get-Counter вернёт
-/// пусто. Поэтому сначала пытаемся построить локализованный путь через реестр
-/// Perflib (английские имена -> ID -> имена текущего языка), а при любой ошибке
-/// откатываемся на английский вариант.
+/// Окно усреднения — интервал между соседними сборами, то есть шаг семплинга
+/// харнесса. Это и есть отличие от прежнего `Get-Counter`, который брал свой
+/// собственный интервал.
 #[cfg(target_os = "windows")]
-async fn windows_gpu_usage() -> f32 {
-    const SCRIPT: &str = r#"
-$ErrorActionPreference = 'SilentlyContinue'
-function Get-GpuCounterPath {
-    try {
-        $base = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib'
-        $en  = (Get-ItemProperty "$base\009").Counter
-        $loc = (Get-ItemProperty "$base\CurrentLanguage").Counter
-        $idOf   = { param($a, $n) for ($i = 1; $i -lt $a.Length; $i += 2) { if ($a[$i] -ieq $n) { return $a[$i - 1] } } }
-        $nameOf = { param($a, $id) for ($i = 0; $i -lt $a.Length; $i += 2) { if ($a[$i] -eq $id) { return $a[$i + 1] } } }
-        $setId = & $idOf $en 'GPU Engine'
-        $ctrId = & $idOf $en 'Utilization Percentage'
-        if ($setId -and $ctrId) {
-            $setL = & $nameOf $loc $setId
-            $ctrL = & $nameOf $loc $ctrId
-            if ($setL -and $ctrL) { return "\$setL(*)\$ctrL" }
+fn windows_gpu_usage(query: isize, counter: isize) -> f32 {
+    if unsafe { PdhCollectQueryData(query) } != PDH_CSTATUS_VALID_DATA {
+        return 0.0;
+    }
+
+    // Протокол у PDH двухшаговый: сначала спрашиваем размер буфера, потом читаем.
+    // Между двумя шагами набор экземпляров может измениться (см. выше — он живой),
+    // и тогда второй вызов снова ответит PDH_MORE_DATA. Поэтому пробуем несколько
+    // раз, а не считаем один промах отказом: молча вернуть 0.0 здесь — как раз
+    // тот отказ, который не отличить от измерения.
+    for _ in 0..3 {
+        let mut size: u32 = 0;
+        let mut items: u32 = 0;
+        let status = unsafe {
+            PdhGetFormattedCounterArrayW(
+                counter,
+                PDH_FMT_DOUBLE,
+                &mut size,
+                &mut items,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != PDH_MORE_DATA {
+            return 0.0;
         }
-    } catch {}
-    return '\GPU Engine(*)\Utilization Percentage'
-}
-$path = Get-GpuCounterPath
-$samples = (Get-Counter $path -ErrorAction SilentlyContinue).CounterSamples
-if ($samples) { ($samples | Measure-Object -Property CookedValue -Maximum).Maximum } else { 0 }
-"#;
 
-    let output = tokio::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", SCRIPT])
-        .output()
-        .await;
+        // Буфер заводим как массив самих структур, а не как Vec<u8>: PDH пишет
+        // сюда PDH_FMT_COUNTERVALUE_ITEM_W, а Vec<u8> выровнен по одному байту,
+        // и чтение структур из него было бы неопределённым поведением.
+        // Хвостом в том же буфере лежат строки имён — отсюда округление вверх.
+        //
+        // Одна аллокация на замер (около 13 КБ на 544 экземпляра) — это то, что
+        // Правило 1 просит не делать в цикле. Осознанно: она заменила запуск
+        // powershell.exe, стоивший 3,2 секунды. Убрать её совсем можно только
+        // переиспользуемым буфером, а он требует мутабельности через `&self`,
+        // то есть Mutex, — цена больше выигрыша.
+        let capacity = (size as usize).div_ceil(size_of::<PdhCounterItem>());
+        let mut buffer: Vec<PdhCounterItem> = Vec::with_capacity(capacity);
 
-    if let Ok(out) = output {
-        return String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse::<f32>()
+        let status = unsafe {
+            PdhGetFormattedCounterArrayW(
+                counter,
+                PDH_FMT_DOUBLE,
+                &mut size,
+                &mut items,
+                buffer.as_mut_ptr(),
+            )
+        };
+        if status == PDH_MORE_DATA {
+            continue; // набор экземпляров успел вырасти — спрашиваем размер заново
+        }
+        if status != PDH_CSTATUS_VALID_DATA {
+            return 0.0;
+        }
+
+        // PDH заполнил `items` элементов; больше, чем влезло в буфер, он не пишет.
+        let filled = (items as usize).min(capacity);
+        let values = unsafe { std::slice::from_raw_parts(buffer.as_ptr(), filled) };
+        return max_engine_usage(values.iter().map(|item| (item.status, item.value)))
             .unwrap_or(0.0)
             .clamp(0.0, 100.0);
     }
+
     0.0
+}
+
+/// Максимум по движкам GPU среди значений, которые PDH пометил валидными.
+///
+/// `None` означает «ни одного валидного значения» и НЕ равно нулю: ноль сказал бы,
+/// что видеокарта простаивала, а здесь мы просто ничего не измерили. В `0.0` это
+/// превращает вызывающая сторона — сознательно и в одном месте, как это уже
+/// сделано для macOS в `parse_ioreg_utilization` (Правило 6).
+#[cfg(target_os = "windows")]
+fn max_engine_usage<I: IntoIterator<Item = (u32, f64)>>(samples: I) -> Option<f32> {
+    samples
+        .into_iter()
+        .filter(|(status, _)| {
+            *status == PDH_CSTATUS_VALID_DATA || *status == PDH_CSTATUS_NEW_DATA
+        })
+        .map(|(_, value)| value as f32)
+        .fold(None, |best: Option<f32>, value| {
+            Some(match best {
+                Some(b) if b >= value => b,
+                _ => value,
+            })
+        })
 }
 
 /// Заглушка для не-Windows сборок, чтобы вызов компилировался.
 #[cfg(not(target_os = "windows"))]
-async fn windows_gpu_usage() -> f32 {
+fn windows_gpu_usage(_query: isize, _counter: isize) -> f32 {
     0.0
 }
 
@@ -281,6 +473,82 @@ fn parse_ioreg_utilization(text: &str) -> Option<f32> {
 #[cfg(not(target_os = "macos"))]
 async fn macos_gpu_usage() -> f32 {
     0.0
+}
+
+/// Этот модуль, в отличие от соседнего macOS-ного, на Windows ВЫПОЛНЯЕТСЯ —
+/// `max_engine_usage` живёт под `#[cfg(target_os = "windows")]`. На Linux и macOS
+/// его в выводе `cargo test` не будет вовсе.
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::*;
+
+    /// Максимум, а не сумма. Суммирование 3D+Copy+Video+Compute завышает
+    /// утилизацию и уходит за 100 %, а `clamp` превращает завышение в ровную
+    /// полку на сотне — то есть в отказ, неотличимый от измерения.
+    /// Красным виден так: заменить `fold` на суммирование — здесь станет 90.
+    #[test]
+    fn takes_the_busiest_engine_not_their_sum() {
+        let samples = [
+            (PDH_CSTATUS_VALID_DATA, 40.0),
+            (PDH_CSTATUS_VALID_DATA, 30.0),
+            (PDH_CSTATUS_VALID_DATA, 20.0),
+        ];
+        assert_eq!(max_engine_usage(samples), Some(40.0));
+    }
+
+    /// PDH помечает часть экземпляров как невалидные (движок исчез между сбором
+    /// и чтением). Их значения — мусор, и попасть в отчёт они не должны.
+    #[test]
+    fn skips_instances_pdh_marked_invalid() {
+        const PDH_CSTATUS_INVALID_DATA: u32 = 0xC000_0BBA;
+        let samples = [
+            (PDH_CSTATUS_VALID_DATA, 7.0),
+            (PDH_CSTATUS_INVALID_DATA, 99.0),
+        ];
+        assert_eq!(max_engine_usage(samples), Some(7.0));
+    }
+
+    /// А вот PDH_CSTATUS_NEW_DATA (1) — валидное значение, а не отказ: так PDH
+    /// помечает экземпляры, обновившиеся с прошлого сбора, то есть РАБОТАЮЩИЕ
+    /// прямо сейчас. Отфильтровать их по «status != 0» — значит выбросить именно
+    /// нагруженные движки и получить правдоподобно заниженную метрику.
+    /// Красным виден так: сузить фильтр до одного PDH_CSTATUS_VALID_DATA.
+    #[test]
+    fn counts_freshly_updated_instances_too() {
+        let samples = [
+            (PDH_CSTATUS_VALID_DATA, 3.0),
+            (PDH_CSTATUS_NEW_DATA, 61.0),
+        ];
+        assert_eq!(max_engine_usage(samples), Some(61.0));
+    }
+
+    /// Ни одного валидного значения — это ОТКАЗ измерения, и на этом уровне он
+    /// обязан быть отличим от честного нуля. В `0.0` его превращает вызывающая
+    /// `windows_gpu_usage` — сознательно и в одном месте (Правило 6).
+    #[test]
+    fn nothing_valid_is_none_not_zero() {
+        const PDH_CSTATUS_INVALID_DATA: u32 = 0xC000_0BBA;
+        assert_eq!(max_engine_usage([(PDH_CSTATUS_INVALID_DATA, 50.0)]), None);
+        assert_eq!(max_engine_usage([]), None);
+    }
+
+    /// Простаивающая видеокарта — это Some(0.0), а не None: ноль здесь измерен.
+    /// Разница видна только на этом уровне, и ради неё функция и отдаёт Option.
+    #[test]
+    fn measured_idle_is_zero_not_absence() {
+        assert_eq!(max_engine_usage([(PDH_CSTATUS_VALID_DATA, 0.0)]), Some(0.0));
+    }
+
+    /// Раскладка PDH_FMT_COUNTERVALUE_ITEM_W задана Windows, а не нами: имя (8) +
+    /// код состояния (4) + выравнивание (4) + значение (8). Разъедется она молча —
+    /// PDH пишет в буфер по своей раскладке, а читаем мы по своей, и в отчёт
+    /// поедут числа, собранные из чужих байтов. Шаг 24 сверен замером на этой
+    /// машине 28.08.2026.
+    #[test]
+    fn counter_item_layout_matches_what_pdh_writes() {
+        assert_eq!(size_of::<PdhCounterItem>(), 24);
+        assert_eq!(align_of::<PdhCounterItem>(), 8);
+    }
 }
 
 /// ВНИМАНИЕ: этот модуль собирается и выполняется ТОЛЬКО на macOS — сама
