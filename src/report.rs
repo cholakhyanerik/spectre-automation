@@ -623,10 +623,117 @@ where
     DB::ErrorType: 'static,
 {
     let (_, h) = area.dim_in_pixel();
-    let y1 = h as i32 - 14;
+    let y1 = h as i32 - TABLE_FRAME_BOTTOM;
     area.draw(&Rectangle::new([(x0, 8), (x1, y1)], Into::<ShapeStyle>::into(C_GRID_BG).filled()))?;
     area.draw(&Rectangle::new([(x0, 8), (x1, y1)], Into::<ShapeStyle>::into(C_LINE).stroke_width(2)))?;
     Ok(())
+}
+
+// ─────────────── Геометрия строк сводной таблицы ───────────────
+
+/// Отступ нижней линии рамки от низа области таблицы. Число одно на оба
+/// отчёта намеренно: им рисует рамку `draw_table_frame`, от него же считается,
+/// сколько строк в эту рамку помещается. Разъедься эти два числа — строки
+/// лягут на линию, и никто об этом не узнает.
+const TABLE_FRAME_BOTTOM: i32 = 14;
+
+/// Сколько пикселей строка занимает ВНИЗ от своей координаты: `plotters`
+/// ставит текст верхним левым углом в заданную точку, поэтому последняя строка
+/// обязана кончиться выше рамки, а не начаться на ней. Кегль строк — 13,
+/// остальное — выносные элементы и просвет до линии.
+const TABLE_ROW_H: i32 = 18;
+
+/// Шаг, ниже которого строки слипаются, — он же высота самой строки. Дальше
+/// сжимать нечего, и это единственный случай, когда переполнение таблицы
+/// становится слышным (`warn_rows_dropped`).
+const TABLE_ROW_MIN_STEP: i32 = TABLE_ROW_H;
+
+/// Холст одиночного отчёта и разбиение его по высоте. Числа собраны здесь, а
+/// не расставлены по месту, потому что высота сводной таблицы — это ОСТАТОК
+/// от них: строки раскладываются по тому, что осталось после двух графиков.
+/// Пока числа одни на код и на тесты, проверки раскладки говорят о настоящем
+/// отчёте; разъедься они — останутся зелёными для геометрии, которой нет.
+const SINGLE_CANVAS: (u32, u32) = (1000, 920);
+const SINGLE_H_HEADER: i32 = 70;
+const SINGLE_H_LOAD: i32 = 370;
+const SINGLE_H_RAM: i32 = 250;
+
+/// Первая строка и желаемый шаг сводной таблицы одиночного отчёта. Пока строк
+/// три, шаг остаётся ровно этим, и отчёт выглядит как прежде.
+const SINGLE_ROW_Y0: i32 = 100;
+const SINGLE_ROW_STEP: i32 = 38;
+
+/// То же для сравнительного отчёта: холст выше и шире, график нагрузки крупнее
+/// (на нём четыре серии вместо двух), а строк в таблице вдвое больше.
+const COMPARE_CANVAS: (u32, u32) = (1180, 990);
+const COMPARE_H_HEADER: i32 = 70;
+const COMPARE_H_LOAD: i32 = 390;
+const COMPARE_H_RAM: i32 = 250;
+const COMPARE_ROW_Y0: i32 = 94;
+const COMPARE_ROW_STEP: i32 = 30;
+
+/// Раскладка строк сводной таблицы: шаг и сколько строк поместилось.
+#[derive(Debug, PartialEq, Eq)]
+struct RowPlan {
+    /// Шаг между строками в пикселях.
+    step: i32,
+    /// Сколько строк помещается внутрь рамки. Меньше запрошенного — значит
+    /// места не хватило даже при минимальном шаге.
+    fits: usize,
+}
+
+/// Раскладывает `rows` строк по высоте, оставшейся до нижней линии рамки.
+///
+/// Шаг выводится из числа строк, а не задаётся константой, и причина — в
+/// молчаливости `plotters`: строка, для которой места не осталось, рисуется
+/// прямо поверх рамки или под ней, без ошибки и без предупреждения. Отчёт
+/// выглядит сломанным только у того, кто его откроет, — то есть месяцы спустя.
+///
+/// Пока строк мало, шаг равен `preferred` и картинка не меняется ни на
+/// пиксель. Как только их становится больше, строки сжимаются, а не
+/// выталкиваются за рамку. Сжатие не бесконечно: `TABLE_ROW_MIN_STEP` —
+/// предел, за которым строки сливаются, и всё, что за него не влезло,
+/// объявляется лишним вслух, а не рисуется наугад.
+fn plan_rows(area_h: i32, first_y: i32, rows: usize, preferred: i32) -> RowPlan {
+    // Самая нижняя координата, с которой строка ещё успевает кончиться до рамки.
+    let last_y = area_h - TABLE_FRAME_BOTTOM - TABLE_ROW_H;
+    let span = last_y - first_y;
+
+    if rows == 0 || span < 0 {
+        return RowPlan { step: preferred, fits: 0 };
+    }
+    if rows == 1 {
+        return RowPlan { step: preferred, fits: 1 };
+    }
+
+    let step = (span / (rows as i32 - 1)).min(preferred);
+    if step >= TABLE_ROW_MIN_STEP {
+        return RowPlan { step, fits: rows };
+    }
+    RowPlan {
+        step: TABLE_ROW_MIN_STEP,
+        fits: (span / TABLE_ROW_MIN_STEP) as usize + 1,
+    }
+}
+
+/// Говорит вслух о строках, не поместившихся в сводную таблицу PNG.
+///
+/// Потерянная строка неотличима от неизмеренной метрики (Правило 6): в
+/// консоли и в JSON число есть, а на картинке его нет, и объяснить это
+/// человек сможет только пересчитав вёрстку руками. Поэтому пропущенные
+/// строки называются поимённо, а не считаются.
+fn warn_rows_dropped(table: &str, labels: &[&str], fits: usize) {
+    if fits >= labels.len() {
+        return;
+    }
+    eprintln!(
+        "⚠️  В таблицу {} на PNG не поместились строки: {}. Высоты хватило на {} из {} — \
+         числа целиком остаются в консольном отчёте и в JSON.",
+        table,
+        labels[fits..].join(", "),
+        fits,
+        labels.len(),
+    );
 }
 
 fn ram_upper_bound(values: &[f64]) -> f64 {
@@ -642,12 +749,12 @@ pub fn generate_single_chart(version_name: &str, result: &TestResult) -> ChartRe
     }
     let s = compute_stats(result);
 
-    let root = BitMapBackend::new(&filename, (1000, 920)).into_drawing_area();
+    let root = BitMapBackend::new(&filename, SINGLE_CANVAS).into_drawing_area();
     root.fill(&WHITE)?;
 
-    let (header, rest) = root.split_vertically(70);
-    let (load_area, rest2) = rest.split_vertically(370);
-    let (ram_area, table_area) = rest2.split_vertically(250);
+    let (header, rest) = root.split_vertically(SINGLE_H_HEADER);
+    let (load_area, rest2) = rest.split_vertically(SINGLE_H_LOAD);
+    let (ram_area, table_area) = rest2.split_vertically(SINGLE_H_RAM);
 
     let platform = if result.platform.is_empty() { "—" } else { result.platform.as_str() };
     let gpu_name = if result.gpu_name.is_empty() {
@@ -785,8 +892,15 @@ pub fn generate_single_chart(version_name: &str, result: &TestResult) -> ChartRe
         ("RAM Allocation", &s.ram, &C_RAM, " MB", 0),
     ];
 
-    for (i, (label, st, color, unit, dec)) in rows.iter().enumerate() {
-        let y = 100 + i as i32 * 38;
+    // Высоту берём у самой области, а не из размера холста: она получается
+    // делением и меняется вместе с любой правкой графиков выше.
+    let (_, table_h) = table_area.dim_in_pixel();
+    let plan = plan_rows(table_h as i32, SINGLE_ROW_Y0, rows.len(), SINGLE_ROW_STEP);
+    let labels: Vec<&str> = rows.iter().map(|r| r.0).collect();
+    warn_rows_dropped("SUMMARY", &labels, plan.fits);
+
+    for (i, (label, st, color, unit, dec)) in rows.iter().take(plan.fits).enumerate() {
+        let y = SINGLE_ROW_Y0 + i as i32 * plan.step;
         table_area.draw(&Text::new(*label, (cols[0], y), f_norm.clone().color(&C_INK)))?;
         let vals = [st.min, st.avg, st.median, st.p95, st.max, st.stddev];
         for (j, v) in vals.iter().enumerate() {
@@ -807,8 +921,10 @@ pub fn generate_single_chart(version_name: &str, result: &TestResult) -> ChartRe
 ///
 /// Строка ложится в свободное место справа от заголовка сводной таблицы — то
 /// есть ВНУТРИ рамки (30..1150) и ВЫШЕ первой строки таблицы. Отдельной
-/// строкой в самой таблице она быть не может: там уже шесть строк, а седьмая
-/// (94 + 6·30 = 274) ушла бы под рамку, идущую по 266. Правый предел взят по
+/// строкой в самой таблице ей не место по смыслу: строки таблицы — измеренные
+/// величины, а очередь замера — условие прогона. Место рядом с заголовком к
+/// тому же ничего не отнимает у строк: высоту между ними делит `plan_rows`,
+/// и седьмая строка ужала бы все шесть остальных. Правый предел взят по
 /// разделительной линии заголовков (1136), чтобы примечание кончалось там же,
 /// где кончается таблица.
 const ORDER_NOTE_X: i32 = 360;
@@ -836,12 +952,12 @@ pub fn generate_comparison_chart(new_res: &TestResult, old_res: &TestResult) -> 
     let sn = compute_stats(new_res);
     let so = compute_stats(old_res);
 
-    let root = BitMapBackend::new(&filename, (1180, 990)).into_drawing_area();
+    let root = BitMapBackend::new(&filename, COMPARE_CANVAS).into_drawing_area();
     root.fill(&WHITE)?;
 
-    let (header, rest) = root.split_vertically(70);
-    let (load_area, rest2) = rest.split_vertically(390);
-    let (ram_area, table_area) = rest2.split_vertically(250);
+    let (header, rest) = root.split_vertically(COMPARE_H_HEADER);
+    let (load_area, rest2) = rest.split_vertically(COMPARE_H_LOAD);
+    let (ram_area, table_area) = rest2.split_vertically(COMPARE_H_RAM);
 
     let platform = if new_res.platform.is_empty() { "—" } else { new_res.platform.as_str() };
     let gpu_name = if new_res.gpu_name.is_empty() {
@@ -1012,8 +1128,13 @@ pub fn generate_comparison_chart(new_res: &TestResult, old_res: &TestResult) -> 
         ("RAM — пик (max)", sn.ram.max, so.ram.max, " MB", 1),
     ];
 
-    for (i, (label, new_v, old_v, unit, dec)) in rows.iter().enumerate() {
-        let y = 94 + i as i32 * 30;
+    let (_, table_h) = table_area.dim_in_pixel();
+    let plan = plan_rows(table_h as i32, COMPARE_ROW_Y0, rows.len(), COMPARE_ROW_STEP);
+    let labels: Vec<&str> = rows.iter().map(|r| r.0).collect();
+    warn_rows_dropped("COMPARISON SUMMARY", &labels, plan.fits);
+
+    for (i, (label, new_v, old_v, unit, dec)) in rows.iter().take(plan.fits).enumerate() {
+        let y = COMPARE_ROW_Y0 + i as i32 * plan.step;
         let diff = new_v - old_v;
         let color = if diff > 0.0 { &C_BAD } else if diff < 0.0 { &C_GOOD } else { &C_INK };
         let sign = if diff > 0.0 { "+" } else { "" };
@@ -1355,5 +1476,145 @@ mod tests {
             narrow.chars().count(),
             wide.chars().count(),
         );
+    }
+
+    /// Высота сводной таблицы — остаток холста после двух графиков.
+    const SINGLE_H_TABLE: i32 =
+        SINGLE_CANVAS.1 as i32 - SINGLE_H_HEADER - SINGLE_H_LOAD - SINGLE_H_RAM;
+    const COMPARE_H_TABLE: i32 =
+        COMPARE_CANVAS.1 as i32 - COMPARE_H_HEADER - COMPARE_H_LOAD - COMPARE_H_RAM;
+
+    /// Высоту области отчёт узнаёт у `plotters` в момент рисования, а тесты
+    /// раскладки считают её вычитанием. Тест сверяет одно с другим: разойдись
+    /// они (сменилась семантика `split_vertically`, появилось четвёртое
+    /// деление) — проверки остались бы зелёными для геометрии, которой в
+    /// отчёте уже нет, а таблица снова поехала бы за рамку без единой ошибки.
+    #[test]
+    fn summary_areas_are_as_tall_as_the_layout_assumes() {
+        let single = {
+            let mut buf = vec![0u8; (SINGLE_CANVAS.0 * SINGLE_CANVAS.1 * 3) as usize];
+            let root = BitMapBackend::with_buffer(&mut buf, SINGLE_CANVAS).into_drawing_area();
+            let (_, rest) = root.split_vertically(SINGLE_H_HEADER);
+            let (_, rest2) = rest.split_vertically(SINGLE_H_LOAD);
+            let (_, table) = rest2.split_vertically(SINGLE_H_RAM);
+            table.dim_in_pixel().1 as i32
+        };
+        assert_eq!(single, SINGLE_H_TABLE, "область сводной таблицы одиночного отчёта");
+
+        let comparison = {
+            let mut buf = vec![0u8; (COMPARE_CANVAS.0 * COMPARE_CANVAS.1 * 3) as usize];
+            let root = BitMapBackend::with_buffer(&mut buf, COMPARE_CANVAS).into_drawing_area();
+            let (_, rest) = root.split_vertically(COMPARE_H_HEADER);
+            let (_, rest2) = rest.split_vertically(COMPARE_H_LOAD);
+            let (_, table) = rest2.split_vertically(COMPARE_H_RAM);
+            table.dim_in_pixel().1 as i32
+        };
+        assert_eq!(comparison, COMPARE_H_TABLE, "область сводной таблицы сравнения");
+    }
+
+    /// `TABLE_ROW_H` — не круглое число из головы, а место, которое строка
+    /// занимает вниз от своей координаты. Мерить его надо тем же шрифтом,
+    /// каким строки рисуются: смени кегль — и запас, на который рассчитана
+    /// раскладка, исчезнет молча, а `plotters` про это ничего не скажет.
+    #[test]
+    fn row_height_covers_the_font_rows_are_drawn_with() {
+        // Тот же шрифт, что у строк таблицы в обоих отчётах.
+        let f_norm = ("sans-serif", 13).into_font();
+        // Строка с выносным элементом («g» в Usage) — самый высокий случай.
+        let (_, h) = f_norm.box_size("CPU Usage 1930.0 MB").expect("шрифт не нашёлся");
+        assert!(
+            (h as i32) <= TABLE_ROW_H,
+            "строка занимает {h} px, а раскладка отводит ей {TABLE_ROW_H}",
+        );
+    }
+
+    /// Правка геометрии не должна менять готовые отчёты ни на пиксель: пока
+    /// строк столько же, сколько было, шаг обязан остаться прежним. Иначе
+    /// архив в `reports/history` разъедется по виду на ровном месте.
+    #[test]
+    fn existing_summaries_keep_their_look() {
+        assert_eq!(
+            plan_rows(SINGLE_H_TABLE, SINGLE_ROW_Y0, 3, SINGLE_ROW_STEP),
+            RowPlan { step: 38, fits: 3 },
+            "одиночная сводка съехала со своих 100 + i·38",
+        );
+        assert_eq!(
+            plan_rows(COMPARE_H_TABLE, COMPARE_ROW_Y0, 6, COMPARE_ROW_STEP),
+            RowPlan { step: 30, fits: 6 },
+            "сравнительная сводка съехала со своих 94 + i·30",
+        );
+    }
+
+    /// Тот самый дефект: седьмая строка сравнительной таблицы вставала на
+    /// 94 + 6·30 = 274 при рамке по 266 и уходила под неё — молча, потому что
+    /// `plotters` рисует ровно там, где попросили, хоть за краем картинки.
+    /// Теперь лишняя строка сжимает шаг, а не выталкивает хвост таблицы.
+    #[test]
+    fn a_seventh_row_compresses_the_step_instead_of_leaving_the_frame() {
+        let plan = plan_rows(COMPARE_H_TABLE, COMPARE_ROW_Y0, 7, COMPARE_ROW_STEP);
+        assert_eq!(plan.fits, 7, "седьмая строка снова не помещается");
+        assert!(plan.step < COMPARE_ROW_STEP, "шаг не сжался: {}", plan.step);
+
+        let last = COMPARE_ROW_Y0 + 6 * plan.step;
+        assert!(
+            last + TABLE_ROW_H <= COMPARE_H_TABLE - TABLE_FRAME_BOTTOM,
+            "седьмая строка стоит на {last} и кончается ниже рамки ({})",
+            COMPARE_H_TABLE - TABLE_FRAME_BOTTOM,
+        );
+    }
+
+    /// Главное свойство раскладки, и проверить его глазами нельзя: отчёт с
+    /// уехавшей строкой выглядит правильным, пока не откроешь PNG. Ни одна
+    /// НАРИСОВАННАЯ строка не выходит за рамку — ни при каком их числе и ни
+    /// в одной из двух таблиц, устроенных по-разному.
+    #[test]
+    fn no_drawn_row_ever_leaves_the_frame() {
+        for (area_h, y0, preferred, table) in [
+            (SINGLE_H_TABLE, SINGLE_ROW_Y0, SINGLE_ROW_STEP, "SUMMARY"),
+            (COMPARE_H_TABLE, COMPARE_ROW_Y0, COMPARE_ROW_STEP, "COMPARISON SUMMARY"),
+        ] {
+            for rows in 1..=40usize {
+                let plan = plan_rows(area_h, y0, rows, preferred);
+                assert!(plan.fits > 0 && plan.fits <= rows, "{table}: {rows} строк дали fits={}", plan.fits);
+                assert!(plan.step >= TABLE_ROW_MIN_STEP, "{table}: строки слиплись при {rows}: шаг {}", plan.step);
+
+                let last = y0 + (plan.fits as i32 - 1) * plan.step;
+                assert!(
+                    last + TABLE_ROW_H <= area_h - TABLE_FRAME_BOTTOM,
+                    "{table}: {rows} строк — последняя на {last}, а рамка идёт по {}",
+                    area_h - TABLE_FRAME_BOTTOM,
+                );
+            }
+        }
+    }
+
+    /// Когда строк больше, чем влезает даже при минимальном шаге, лишние не
+    /// рисуются вовсе, а называются вслух (`warn_rows_dropped`). Молча
+    /// нарисованная под рамкой строка — испорченный отчёт, молча пропущенная —
+    /// метрика, неотличимая от неизмеренной; слышный отказ лучше обоих.
+    #[test]
+    fn rows_beyond_the_limit_are_dropped_not_squeezed() {
+        // Одиночная таблица: от 100 до 198 при шаге 18 — шесть строк, не больше.
+        let plan = plan_rows(SINGLE_H_TABLE, SINGLE_ROW_Y0, 12, SINGLE_ROW_STEP);
+        assert_eq!(plan.step, TABLE_ROW_MIN_STEP, "шаг ушёл ниже предела слипания");
+        assert_eq!(plan.fits, 6, "в одиночную сводку помещается ровно шесть строк");
+
+        // Сравнительная выше и вмещает девять.
+        let plan = plan_rows(COMPARE_H_TABLE, COMPARE_ROW_Y0, 12, COMPARE_ROW_STEP);
+        assert_eq!(plan.step, TABLE_ROW_MIN_STEP);
+        assert_eq!(plan.fits, 9, "в сравнительную сводку помещается ровно девять строк");
+    }
+
+    /// Вырожденные случаи не должны ронять прогон паникой уже ПОСЛЕ замера:
+    /// делить на `rows − 1` при одной строке нельзя, а на области, где до
+    /// рамки не осталось места, не помещается вообще ничего.
+    #[test]
+    fn degenerate_layouts_stay_silent_and_alive() {
+        assert_eq!(plan_rows(SINGLE_H_TABLE, SINGLE_ROW_Y0, 0, SINGLE_ROW_STEP).fits, 0);
+        assert_eq!(
+            plan_rows(SINGLE_H_TABLE, SINGLE_ROW_Y0, 1, SINGLE_ROW_STEP),
+            RowPlan { step: SINGLE_ROW_STEP, fits: 1 },
+        );
+        assert_eq!(plan_rows(60, SINGLE_ROW_Y0, 3, SINGLE_ROW_STEP).fits, 0);
     }
 }
