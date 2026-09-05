@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo tree *)",
+      "Bash(cargo update *)",
+      "Bash(powershell -NoProfile -Command 'Get-Process | Where-Object { $_.ProcessName -like '\\\\''*TD-*'\\\\'' -or $_.ProcessName -like '\\\\''*spectre*'\\\\'' } | Select-Object Id,ProcessName | Format-Table -AutoSize')",
+      "PowerShell($env:TEST_DURATION_SECS = \"60\"; .\\\\target\\\\release\\\\spectre-automation.exe)",
+      "PowerShell($env:APP_PATH_NEW = 'C:\\\\Users\\\\chola\\\\Downloads\\\\spectre-terminal.exe'; $env:TEST_DURATION_SECS = '60'; .\\\\target\\\\release\\\\spectre-automation.exe)",
+      "Bash(python -c ' *)",
+      "PowerShell(1..6 | ForEach-Object { $u = \\(nvidia-smi --query-gpu=utilization.gpu,name --format=csv,noheader\\); \"sample $_`: $u\"; Start-Sleep -Milliseconds 700 })"
+    ]
+  }
+}
