@@ -7,7 +7,9 @@
       "PowerShell($env:TEST_DURATION_SECS = \"60\"; .\\\\target\\\\release\\\\spectre-automation.exe)",
       "PowerShell($env:APP_PATH_NEW = 'C:\\\\Users\\\\chola\\\\Downloads\\\\spectre-terminal.exe'; $env:TEST_DURATION_SECS = '60'; .\\\\target\\\\release\\\\spectre-automation.exe)",
       "Bash(python -c ' *)",
-      "PowerShell(1..6 | ForEach-Object { $u = \\(nvidia-smi --query-gpu=utilization.gpu,name --format=csv,noheader\\); \"sample $_`: $u\"; Start-Sleep -Milliseconds 700 })"
+      "PowerShell(1..6 | ForEach-Object { $u = \\(nvidia-smi --query-gpu=utilization.gpu,name --format=csv,noheader\\); \"sample $_`: $u\"; Start-Sleep -Milliseconds 700 })",
+      "Bash(python \"C:/Users/chola/AppData/Local/Temp/claude/c--Users-chola-OneDrive-Documents-spectre-automation/fc2220f3-1e6c-4ec7-aa24-badc52e35bb6/scratchpad/reorder.py\")",
+      "Bash(PYTHONIOENCODING=utf-8 python \"C:/Users/chola/AppData/Local/Temp/claude/c--Users-chola-OneDrive-Documents-spectre-automation/fc2220f3-1e6c-4ec7-aa24-badc52e35bb6/scratchpad/reorder.py\")"
     ]
   }
 }
