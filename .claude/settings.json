@@ -19,7 +19,9 @@
       "PowerShell(& \"C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-spectre-automation\\\\28c6f7b0-14ba-496e-a742-b4361f8a8068\\\\scratchpad\\\\live-guard-a.ps1\")",
       "PowerShell(& \"C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-spectre-automation\\\\28c6f7b0-14ba-496e-a742-b4361f8a8068\\\\scratchpad\\\\live-guard-b.ps1\")",
       "PowerShell(& \"C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-spectre-automation\\\\28c6f7b0-14ba-496e-a742-b4361f8a8068\\\\scratchpad\\\\live-clean-run.ps1\")",
-      "PowerShell(cmd /c \"git diff -- .claude/settings.json 2>&1\")"
+      "PowerShell(cmd /c \"git diff -- .claude/settings.json 2>&1\")",
+      "Bash(cargo add *)",
+      "PowerShell(& \"C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-spectre-automation\\\\5c60a4ea-473e-423d-8658-3e034763af07\\\\scratchpad\\\\mutate.ps1\")"
     ]
   }
 }

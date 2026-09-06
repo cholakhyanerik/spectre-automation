@@ -156,6 +156,79 @@ enum Which {
     Old,
 }
 
+impl Which {
+    /// Короткое имя сборки для сообщений о стенде.
+    fn label(self) -> &'static str {
+        match self {
+            Which::New => "актуальная сборка",
+            Which::Old => "старая сборка",
+        }
+    }
+}
+
+/// Что сказать, если замер изменил состояние стенда. `None` — говорить нечего.
+///
+/// Молчание здесь имеет ровно одно значение: состояние прочитано дважды и оно
+/// одинаковое. Случай «прочитать не удалось» молчанием НЕ считается — иначе
+/// сломавшаяся проверка выглядела бы как успешная, и человек унёс бы из прогона
+/// уверенность, которой никто не проверял (Правило 6).
+fn schema_change_note(label: &str, before: &instance::Schema, after: &instance::Schema) -> Option<String> {
+    match before.differs_from(after) {
+        Some(true) => Some(format!(
+            "⚠️  Замер ({label}) изменил состояние стенда: было «{}», стало «{}».\n\
+             \x20   Терминал накатывает миграции схемы при старте, а обратных не хранит.\n\
+             \x20   Следующая сборка стартует уже на ЭТОМ состоянии, и её числа будут про\n\
+             \x20   другой стенд — в отчёте это выглядит обычной разницей сборок.",
+            before.describe(),
+            after.describe()
+        )),
+        Some(false) => None,
+        None => Some(format!(
+            "⚠️  Сверить состояние стенда после замера ({label}) не удалось: было «{}», стало «{}».\n\
+             \x20   Менялась ли схема за этот замер — неизвестно, а это не то же самое, что\n\
+             \x20   «не менялась».",
+            before.describe(),
+            after.describe()
+        )),
+    }
+}
+
+/// Что сказать, если две сборки прогона стартовали на разных стендах.
+///
+/// Это и есть ответ на вопрос «сравнивали ли одинаковое», и отвечает на него
+/// не догадка, а два факта, снятых до запусков. Сравниваются именно НАЧАЛЬНЫЕ
+/// состояния: разойтись они могут не только от миграций первой сборки, но и от
+/// чего угодно ещё, что случилось со стендом между замерами.
+///
+/// При нечитаемом состоянии молчит намеренно: об этом уже сказано строкой
+/// «Состояние стенда перед замером», и повторять то же самое вторым
+/// предупреждением — верный способ приучить не читать оба.
+fn schema_gap_note(first: (&str, &instance::Schema), second: (&str, &instance::Schema)) -> Option<String> {
+    if first.1.differs_from(second.1) != Some(true) {
+        return None;
+    }
+    Some(format!(
+        "⚠️  Сборки стартовали на РАЗНЫХ состояниях стенда — сравнивать их числа нельзя.\n\
+         \x20   Перед замером ({}): {}\n\
+         \x20   Перед замером ({}): {}\n\
+         \x20   Обратных миграций терминал не хранит, поэтому вернуть стенд в прежнее\n\
+         \x20   состояние сам харнесс не может. Разница в отчёте окажется разницей\n\
+         \x20   СОСТОЯНИЙ, а не сборок: сколько окон восстановить, сколько подписок\n\
+         \x20   открыть — решает стейт. Перемеряйте сборки на одинаковом стенде.",
+        first.0,
+        first.1.describe(),
+        second.0,
+        second.1.describe()
+    ))
+}
+
+/// Опрашивает стенд после замера и говорит, если этот замер его изменил.
+fn note_schema_after(label: &str, before: &instance::Schema, db_path: &Path) {
+    if let Some(note) = schema_change_note(label, before, &instance::schema(db_path)) {
+        eprintln!("{note}");
+    }
+}
+
 /// Составляет очередь замеров на этот запуск харнесса.
 ///
 /// Вынесено в чистую функцию, потому что ошибиться здесь можно молча и дорого.
@@ -344,16 +417,32 @@ async fn main() {
 
     let mut result_new: Option<monitor::TestResult> = None;
     let mut result_old: Option<monitor::TestResult> = None;
+    // Состояние стенда перед ПЕРВЫМ замером: с ним сверяется второй. Разошлись —
+    // сборки мерились на разных стендах, и разница в отчёте про них, а не про код.
+    let mut first_start: Option<(&str, instance::Schema)> = None;
 
     for (i, which) in sequence.iter().enumerate() {
         // Позиция замера уезжает в TestResult и дальше в архив: без неё через
         // месяцы не отличить сборку, мерившуюся на холодной машине, от второй.
         let position = (i + 1) as u8;
         let step = format!("[Шаг {}/{}]", position, total);
+        let label = which.label();
+
+        // Стенд опрашивается ДО запуска и ПОСЛЕ убийства, а не по ходу замера:
+        // база у терминала и у харнесса одна, и чтение во время прогона стало бы
+        // конкуренцией за те же страницы. Оба опроса стоят вне цикла семплинга и
+        // вместе стоят миллисекунды.
+        let schema_before = instance::schema(&cfg.db_path);
+        println!("🗄️  Состояние стенда перед замером ({label}): {}", schema_before.describe());
+        if let Some((first_label, first_schema)) = &first_start
+            && let Some(note) = schema_gap_note((first_label, first_schema), (label, &schema_before))
+        {
+            eprintln!("{note}");
+        }
 
         match which {
             Which::New => {
-                let Some(result) = run_single_test(
+                let measured = run_single_test(
                     &step,
                     "АКТУАЛЬНОЙ версии",
                     &cfg.app_path_new,
@@ -362,8 +451,10 @@ async fn main() {
                     position,
                     &cfg.db_path,
                 )
-                .await
-                else {
+                .await;
+                note_schema_after(label, &schema_before, &cfg.db_path);
+
+                let Some(result) = measured else {
                     // Единственный провал, который роняет прогон, — и он роняет
                     // его в любой очереди, а не только когда идёт первым.
                     eprintln!("❌ Не удалось протестировать актуальную версию. Завершение работы.");
@@ -389,7 +480,7 @@ async fn main() {
                 let Some(app_path_old) = cfg.app_path_old.as_deref() else {
                     continue;
                 };
-                if let Some(result) = run_single_test(
+                let measured = run_single_test(
                     &step,
                     "СТАРОЙ версии",
                     app_path_old,
@@ -398,8 +489,10 @@ async fn main() {
                     position,
                     &cfg.db_path,
                 )
-                .await
-                {
+                .await;
+                note_schema_after(label, &schema_before, &cfg.db_path);
+
+                if let Some(result) = measured {
                     println!("✅ Тест старой версии завершен.");
 
                     report::print_visual_report(&result);
@@ -408,6 +501,12 @@ async fn main() {
                     result_old = Some(result);
                 }
             }
+        }
+
+        // Эталон для сверки — состояние перед ПЕРВЫМ замером, а не перед
+        // предыдущим: вопрос в том, одинаковый ли стенд достался сборкам.
+        if first_start.is_none() {
+            first_start = Some((label, schema_before));
         }
     }
 
@@ -482,6 +581,72 @@ mod tests {
                 "старая сборка мерится не один раз при порядке {order:?}: {with_old:?}"
             );
         }
+    }
+
+    fn applied(count: i64, version: &str) -> instance::Schema {
+        instance::Schema::Applied {
+            count,
+            version: version.to_string(),
+            name: "seed_signal_level_hotkey".to_string(),
+        }
+    }
+
+    /// Накатанная за замер миграция обязана быть названа вслух: обратных
+    /// миграций терминал не хранит, то есть следующая сборка получит уже другой
+    /// стенд, а в отчёте это будет выглядеть обычной разницей сборок.
+    #[test]
+    fn migration_during_a_run_is_spoken_out_loud() {
+        let note = schema_change_note("актуальная сборка", &applied(42, "m040"), &applied(43, "m041"))
+            .expect("изменение схемы осталось без единого слова");
+
+        assert!(note.contains("m040"), "не названо прежнее состояние: {note}");
+        assert!(note.contains("m041"), "не названо новое состояние: {note}");
+    }
+
+    /// Стенд не тронут — и говорить нечего: предупреждение, печатающееся на
+    /// каждом прогоне, перестают читать, и вместе с ним перестают читать
+    /// настоящее.
+    #[test]
+    fn untouched_stand_says_nothing() {
+        assert_eq!(schema_change_note("старая сборка", &applied(42, "m040"), &applied(42, "m040")), None);
+        assert_eq!(
+            schema_change_note("старая сборка", &instance::Schema::Absent, &instance::Schema::Absent),
+            None
+        );
+    }
+
+    /// А вот «не смогли посмотреть» молчанием не считается. Иначе отказ проверки
+    /// выглядел бы точно так же, как её успех, — то есть человек унёс бы из
+    /// прогона уверенность, которой никто не проверял.
+    #[test]
+    fn unreadable_stand_is_not_silence() {
+        let unknown = instance::Schema::Unknown("нет прав".to_string());
+        assert!(
+            schema_change_note("актуальная сборка", &applied(42, "m040"), &unknown).is_some(),
+            "нечитаемое состояние после замера принято за «ничего не изменилось»"
+        );
+    }
+
+    /// Главный вопрос задачи: одинаковый ли стенд достался обеим сборкам.
+    /// Разошлись начальные состояния — сравнение недействительно, и сказать об
+    /// этом надо там же, где числа, а не оставлять на догадку.
+    #[test]
+    fn builds_starting_on_different_stands_are_called_out() {
+        let note = schema_gap_note(
+            ("актуальная сборка", &applied(42, "m040")),
+            ("старая сборка", &applied(43, "m041")),
+        )
+        .expect("разные стенды у двух сборок остались без предупреждения");
+        assert!(note.contains("актуальная сборка") && note.contains("старая сборка"), "{note}");
+
+        assert_eq!(
+            schema_gap_note(
+                ("актуальная сборка", &applied(42, "m040")),
+                ("старая сборка", &applied(42, "m040"))
+            ),
+            None,
+            "одинаковый стенд не должен давать предупреждения"
+        );
     }
 
     /// Регрессия на дефект «блокирующий sleep внутри async»: синхронный шаг
