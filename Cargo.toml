@@ -1,6 +1,6 @@
 [package]
 name = "spectre-automation"
-version = "0.4.6"
+version = "0.5.0"
 edition = "2024"
 
 # Требования записаны обычным semver ("0.39" — это ^0.39), а НЕ ">= 0.39".

@@ -172,13 +172,30 @@ impl Which {
 /// одинаковое. Случай «прочитать не удалось» молчанием НЕ считается — иначе
 /// сломавшаяся проверка выглядела бы как успешная, и человек унёс бы из прогона
 /// уверенность, которой никто не проверял (Правило 6).
-fn schema_change_note(label: &str, before: &instance::Schema, after: &instance::Schema) -> Option<String> {
+///
+/// `restores` — вернётся ли стенд после этого замера (`RESTORE_STAND`). От него
+/// зависит не факт, а вывод: схема сдвинута в обоих случаях, но при включённом
+/// восстановлении следующая сборка её уже не увидит. Оставить один текст на оба
+/// случая значило бы соврать ровно в ту сторону, в какую человек и без того
+/// боится ошибиться.
+fn schema_change_note(
+    label: &str,
+    before: &instance::Schema,
+    after: &instance::Schema,
+    restores: bool,
+) -> Option<String> {
+    let consequence = if restores {
+        "\x20   Перед следующим замером стенд будет возвращён в снятое до прогона состояние\n\
+         \x20   (RESTORE_STAND включён), поэтому на сравнение сборок это не повлияет."
+    } else {
+        "\x20   Следующая сборка стартует уже на ЭТОМ состоянии, и её числа будут про\n\
+         \x20   другой стенд — в отчёте это выглядит обычной разницей сборок."
+    };
     match before.differs_from(after) {
         Some(true) => Some(format!(
             "⚠️  Замер ({label}) изменил состояние стенда: было «{}», стало «{}».\n\
              \x20   Терминал накатывает миграции схемы при старте, а обратных не хранит.\n\
-             \x20   Следующая сборка стартует уже на ЭТОМ состоянии, и её числа будут про\n\
-             \x20   другой стенд — в отчёте это выглядит обычной разницей сборок.",
+             {consequence}",
             before.describe(),
             after.describe()
         )),
@@ -223,9 +240,95 @@ fn schema_gap_note(first: (&str, &instance::Schema), second: (&str, &instance::S
 }
 
 /// Опрашивает стенд после замера и говорит, если этот замер его изменил.
-fn note_schema_after(label: &str, before: &instance::Schema, db_path: &Path) {
-    if let Some(note) = schema_change_note(label, before, &instance::schema(db_path)) {
+fn note_schema_after(label: &str, before: &instance::Schema, db_path: &Path, restores: bool) {
+    if let Some(note) = schema_change_note(label, before, &instance::schema(db_path), restores) {
         eprintln!("{note}");
+    }
+}
+
+/// Куда кладётся снимок стенда на время прогона.
+///
+/// Не в `reports/current`: тот очищается перед прогоном и целиком копируется в
+/// архив, а восьмимегабайтная копия чужой базы в архиве замеров не нужна. И не
+/// во временный каталог системы: если харнесс прервётся между замерами, стенд
+/// останется в состоянии после первой сборки, и вернуть его руками человек
+/// сможет только из этих файлов — значит лежать они должны там, где их найдут.
+/// Каталог перезаписывается на каждом прогоне со снимком.
+const STAND_SNAPSHOT_DIR: &str = "reports/stand-snapshot";
+
+/// Снимает копию стенда перед прогоном — или объясняет, почему не снимает.
+///
+/// `None` означает «восстанавливать нечем», и дальше прогон идёт ровно так, как
+/// шёл до появления флага: со сверкой состояний и предупреждением о расхождении.
+/// Отказываться мерить из-за неснятого снимка нельзя — это превратило бы
+/// вспомогательную удобность в третью причину, по которой замера нет.
+fn take_stand_snapshot(cfg: &Config, steps: usize) -> Option<instance::Snapshot> {
+    if !cfg.restore_stand {
+        return None;
+    }
+    if steps < 2 {
+        // Человек ЗАДАЛ восстановление и не задал вторую сборку. Промолчать
+        // нельзя: он ждёт выравненного стенда, а выравнивать не между чем.
+        println!("ℹ️  RESTORE_STAND включён, но сборка одна — стенд возвращать не перед чем.");
+        return None;
+    }
+    // Снимок делается с ПОКОЯЩЕГОСЯ стенда. Под живым терминалом копия вышла бы
+    // рваной: часть страниц из базы, часть из журнала, и вернули бы мы состояние,
+    // которого не было ни до, ни после.
+    if stand_is_busy(&cfg.db_path) {
+        return None;
+    }
+
+    match instance::snapshot(&cfg.db_path, Path::new(STAND_SNAPSHOT_DIR)) {
+        Ok(snap) => {
+            println!(
+                "🗄️  Снимок стенда снят ({} файлов в {}): {}",
+                snap.captured(),
+                snap.dir().display(),
+                snap.schema().describe()
+            );
+            println!("   Перед вторым замером стенд будет возвращён в это состояние, чтобы обе");
+            println!("   сборки стартовали одинаково. Это единственное место, где харнесс ПИШЕТ");
+            println!("   в каталог данных приложения.");
+            Some(snap)
+        }
+        Err(why) => {
+            eprintln!("⚠️  Снимок стенда не снялся: {why}.");
+            eprintln!("    Замер продолжается БЕЗ восстановления: сборкам достанутся разные");
+            eprintln!("    состояния, и о расхождении харнесс скажет отдельно.");
+            None
+        }
+    }
+}
+
+/// Возвращает стенд в состояние, снятое до прогона.
+///
+/// Проверка замка здесь обязательна и стоит именно перед записью: `probe`
+/// делался до первого запуска, а с тех пор прошёл целый замер. Останься терминал
+/// жив (не добился, открыт человеком) — восстановление писало бы в базу под
+/// живым процессом, то есть не выравнивало бы стенд, а портило его, заодно
+/// рискуя тем, что этот процесс успел не сохранить.
+fn restore_stand(snap: &instance::Snapshot, db_path: &Path) {
+    if stand_is_busy(db_path) {
+        eprintln!("⚠️  Стенд не возвращён: терминал ещё жив, писать в базу под ним нельзя.");
+        return;
+    }
+    match snap.restore() {
+        Ok(instance::Restored::Confirmed) => {
+            println!("🗄️  Стенд возвращён в снятое до прогона состояние: {}", snap.schema().describe());
+        }
+        Ok(instance::Restored::Unverified(now)) => {
+            eprintln!("⚠️  Стенд возвращён, но подтвердить это состоянием не вышло:");
+            eprintln!("    снимали «{}», сейчас читается «{}».", snap.schema().describe(), now.describe());
+            eprintln!("    Одинаковый ли стенд достался сборкам — неизвестно, а это не то же");
+            eprintln!("    самое, что «одинаковый».");
+        }
+        Err(why) => {
+            eprintln!("❌ Стенд НЕ возвращён: {why}.");
+            eprintln!("   Замер продолжается, но сборки мерятся на разных состояниях — сравнивать");
+            eprintln!("   их числа нельзя. Копия стенда лежит в {}: вернуть её", STAND_SNAPSHOT_DIR);
+            eprintln!("   можно руками, скопировав файлы обратно рядом с {}.", db_path.display());
+        }
     }
 }
 
@@ -415,6 +518,11 @@ async fn main() {
     let total = sequence.len();
     announce_run_order(cfg.run_order, has_old);
 
+    // Снимок снимается ДО первого запуска: вернуть стенд можно только в то
+    // состояние, которое видела первая сборка. `None` — восстановления не будет
+    // (флаг выключен, сборка одна или снимок не снялся).
+    let snapshot = take_stand_snapshot(&cfg, total);
+
     let mut result_new: Option<monitor::TestResult> = None;
     let mut result_old: Option<monitor::TestResult> = None;
     // Состояние стенда перед ПЕРВЫМ замером: с ним сверяется второй. Разошлись —
@@ -427,6 +535,20 @@ async fn main() {
         let position = (i + 1) as u8;
         let step = format!("[Шаг {}/{}]", position, total);
         let label = which.label();
+        // Вернётся ли стенд ПОСЛЕ этого замера. На последнем шаге — нет, даже при
+        // включённом флаге: снимок выравнивает сборки между собой, а не прибирает
+        // за прогоном, и следующему прогону стенд достанется таким, каким его
+        // оставила последняя сборка.
+        let restored_after = snapshot.is_some() && i + 1 < total;
+
+        // Стенд возвращается ПЕРЕД чтением состояния, а не после: печатается то,
+        // на чём замер реально пойдёт. Перед первым замером возвращать не к чему —
+        // снимок с него и снят.
+        if i > 0
+            && let Some(snap) = &snapshot
+        {
+            restore_stand(snap, &cfg.db_path);
+        }
 
         // Стенд опрашивается ДО запуска и ПОСЛЕ убийства, а не по ходу замера:
         // база у терминала и у харнесса одна, и чтение во время прогона стало бы
@@ -452,7 +574,7 @@ async fn main() {
                     &cfg.db_path,
                 )
                 .await;
-                note_schema_after(label, &schema_before, &cfg.db_path);
+                note_schema_after(label, &schema_before, &cfg.db_path, restored_after);
 
                 let Some(result) = measured else {
                     // Единственный провал, который роняет прогон, — и он роняет
@@ -490,7 +612,7 @@ async fn main() {
                     &cfg.db_path,
                 )
                 .await;
-                note_schema_after(label, &schema_before, &cfg.db_path);
+                note_schema_after(label, &schema_before, &cfg.db_path, restored_after);
 
                 if let Some(result) = measured {
                     println!("✅ Тест старой версии завершен.");
@@ -596,11 +718,37 @@ mod tests {
     /// стенд, а в отчёте это будет выглядеть обычной разницей сборок.
     #[test]
     fn migration_during_a_run_is_spoken_out_loud() {
-        let note = schema_change_note("актуальная сборка", &applied(42, "m040"), &applied(43, "m041"))
+        let note = schema_change_note("актуальная сборка", &applied(42, "m040"), &applied(43, "m041"), false)
             .expect("изменение схемы осталось без единого слова");
 
         assert!(note.contains("m040"), "не названо прежнее состояние: {note}");
         assert!(note.contains("m041"), "не названо новое состояние: {note}");
+    }
+
+    /// Один и тот же сдвиг схемы значит разное в зависимости от того, вернут ли
+    /// стенд. Оставь здесь один текст на оба случая — и при включённом
+    /// `RESTORE_STAND` харнесс пугал бы человека тем, чего сам уже не допускает,
+    /// а при выключенном успокаивал бы там, где успокаивать нельзя.
+    #[test]
+    fn consequence_of_a_migration_depends_on_whether_the_stand_returns() {
+        let (before, after) = (applied(42, "m040"), applied(43, "m041"));
+        let kept = schema_change_note("актуальная сборка", &before, &after, false)
+            .expect("изменение схемы осталось без единого слова");
+        let returned = schema_change_note("актуальная сборка", &before, &after, true)
+            .expect("изменение схемы осталось без единого слова");
+
+        assert!(
+            kept.contains("Следующая сборка стартует уже на ЭТОМ состоянии"),
+            "без восстановления не сказано, что стенд достанется следующей сборке: {kept}"
+        );
+        assert!(
+            returned.contains("RESTORE_STAND"),
+            "с восстановлением не сказано, что стенд будет возвращён: {returned}"
+        );
+        assert!(
+            !returned.contains("Следующая сборка стартует уже на ЭТОМ состоянии"),
+            "с восстановлением осталось предупреждение, которое уже неверно: {returned}"
+        );
     }
 
     /// Стенд не тронут — и говорить нечего: предупреждение, печатающееся на
@@ -608,9 +756,12 @@ mod tests {
     /// настоящее.
     #[test]
     fn untouched_stand_says_nothing() {
-        assert_eq!(schema_change_note("старая сборка", &applied(42, "m040"), &applied(42, "m040")), None);
         assert_eq!(
-            schema_change_note("старая сборка", &instance::Schema::Absent, &instance::Schema::Absent),
+            schema_change_note("старая сборка", &applied(42, "m040"), &applied(42, "m040"), false),
+            None
+        );
+        assert_eq!(
+            schema_change_note("старая сборка", &instance::Schema::Absent, &instance::Schema::Absent, true),
             None
         );
     }
@@ -622,7 +773,7 @@ mod tests {
     fn unreadable_stand_is_not_silence() {
         let unknown = instance::Schema::Unknown("нет прав".to_string());
         assert!(
-            schema_change_note("актуальная сборка", &applied(42, "m040"), &unknown).is_some(),
+            schema_change_note("актуальная сборка", &applied(42, "m040"), &unknown, false).is_some(),
             "нечитаемое состояние после замера принято за «ничего не изменилось»"
         );
     }

@@ -21,7 +21,11 @@
       "PowerShell(& \"C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-spectre-automation\\\\28c6f7b0-14ba-496e-a742-b4361f8a8068\\\\scratchpad\\\\live-clean-run.ps1\")",
       "PowerShell(cmd /c \"git diff -- .claude/settings.json 2>&1\")",
       "Bash(cargo add *)",
-      "PowerShell(& \"C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-spectre-automation\\\\5c60a4ea-473e-423d-8658-3e034763af07\\\\scratchpad\\\\mutate.ps1\")"
+      "PowerShell(& \"C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-spectre-automation\\\\5c60a4ea-473e-423d-8658-3e034763af07\\\\scratchpad\\\\mutate.ps1\")",
+      "PowerShell(git checkout -- src/main.rs)",
+      "PowerShell(git check-ignore -v reports/stand-snapshot/exchanges.db)",
+      "PowerShell(Select-String -Path src\\\\main.rs,src\\\\config.rs,src\\\\instance.rs,src\\\\monitor.rs -Pattern '^\\(pub \\)?\\(async \\)?fn |^pub const |^const |^pub enum |^pub struct |^impl ' | ForEach-Object { \"{0}:{1}  {2}\" -f $_.Filename, $_.LineNumber, $_.Line.Trim\\(\\) })",
+      "PowerShell(Select-String -Path FEATURE_TASKS.txt -Pattern 'main\\\\.rs:\\\\d+|config\\\\.rs:\\\\d+|instance\\\\.rs:\\\\d+' | ForEach-Object { \"{0}: {1}\" -f $_.LineNumber, $_.Line.Trim\\(\\) })"
     ]
   }
 }
